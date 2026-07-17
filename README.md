@@ -10,7 +10,7 @@ push the older ones down. That's the whole ritual.
 > (**Liner → Session → Message**), same append-only feed, timestamps, label
 > inheritance, and slash-command language — with the Electron runtime replaced
 > by a ~zero-dependency Lua plugin that lives where the writing already
-> happens. Data from the 2024 app imports cleanly via `> olwb migrate`.
+> happens.
 
 ## The interface
 
@@ -21,7 +21,7 @@ push the older ones down. That's the whole ritual.
   █ the one line (highlighted, auto-grows)          capture happens here
   ───────────────────────────────────────────────
     ─────────────────────────────
-    HEY CLAUDE THIS LOOKS GREAT MAN                 newest message
+    HEY THIS LOOKS GREAT MAN                        newest message
     2026-07-17 01:16:42
     ─────────────────────────────
     so i can go to this level                       …older ones pushed down
@@ -111,7 +111,6 @@ handy for keybindings and macros.
 ### Native-only commands
 
 ```
-> olwb migrate <dir>     import an Electron OLWB userData directory
 > olwb rescan            rebuild the liner registry from disk
 > olwb selftest          run built-in storage self-tests (writes a report buffer)
 ```
@@ -175,18 +174,6 @@ A liner file:
 - **Atomic writes**: every save goes to `<file>.tmp` then `os.Rename`s into
   place; a backup is taken before `/close` and before migration.
 
-### Migrating from the Electron app
-
-```
-> olwb migrate /path/to/electron/userData
-```
-
-Reconstructs nested liner files from the old flat
-`liners.json` + `sessions.json` + `messages.json` by resolving the reference
-arrays. Messages referenced by nothing are recovered into a synthesized
-`recovered` liner with their original timestamps intact. Idempotent: existing
-target ids are skipped, never overwritten. Source files are left untouched.
-
 ## Architecture
 
 Pure Lua, single process. The one third-party file is vendored
@@ -222,6 +209,14 @@ Inside the editor, `> olwb selftest` exercises id generation, save/load,
 unicode round-trips, descending order and label resolution against a temp file
 and prints a pass/fail report buffer.
 
+## Roadmap
+
+The point of the parking lot is what happens next: per-message navigation and
+multi-select in the feed, then `/send` — shipping a selected group of messages
+(or the whole scope) to destinations like `claude`, `leather`, the clipboard,
+or a file, with LLM responses landing in a dedicated liner. The design lives
+in [`.agents/plans/olwb-benefits-plan.md`](.agents/plans/olwb-benefits-plan.md).
+
 ## License
 
-Plugin code: see repository. Vendored `json.lua` is MIT © rxi.
+[MIT](LICENSE) © 2026 Tyler Pate. Vendored `json.lua` is MIT © rxi.

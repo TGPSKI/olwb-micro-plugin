@@ -3,10 +3,11 @@
   "Description": "one-line-with-benefits: a descending-time, one-line-input notepad (Liner -> Session -> Message) inside micro.",
   "Website": "https://github.com/TGPSKI/olwb-micro-plugin",
   "Tags": ["notes", "journal", "log", "notepad"],
+  "License": "MIT",
   "Versions": [
     {
       "Version": "1.0.0",
-      "Url": "https://github.com/TGPSKI/olwb-micro-plugin/archive/v1.0.0.zip",
+      "Url": "https://github.com/TGPSKI/olwb-micro-plugin/releases/download/v1.0.0/olwb-1.0.0.zip",
       "Require": {
         "micro": ">=2.0.0"
       }

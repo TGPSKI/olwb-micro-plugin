@@ -1,0 +1,5 @@
+# micro debug log
+log.txt
+# editor/OS cruft
+*.swp
+.DS_Store

@@ -10,6 +10,8 @@ local micro = import("micro")
 local config = import("micro/config")
 local buffer = import("micro/buffer")
 local util = import("micro/util")
+local shell = import("micro/shell")
+local goos = import("os") -- Go os: Getenv/Remove (Lua's os stays untouched)
 local time = import("time")
 
 local FEED_PATH = "olwb://feed"
@@ -29,6 +31,7 @@ local OPTION_DOCS = {
   { "composesize", "minimum one-line height in rows" },
   { "datadir",     "storage dir (empty = $XDG_DATA_HOME/olwb)" },
   { "rulewidth",   "feed separator width" },
+  { "termcmd",     "terminal command for /send <dest> tui (state, not settings)" },
   { "theme",       "apply the bundled olwb colorscheme" },
   { "timefmt",     "strftime timestamp format" },
 }
@@ -41,11 +44,21 @@ local compose_pane   -- BufPane holding the compose line
 local feed_pane      -- BufPane showing the feed (or the /? menu overlay)
 local bar_pane       -- two-row Liner/Session bar at the bottom
 local ui_open = false
-local help_open = false    -- /? toggled the menu overlay on
-local options_open = false -- /set toggled the options overlay on
+local overlay_kind         -- nil | "help" | "options" | "dests" | "sessions" | "issues"
 local compose_rows = 1     -- current input height (auto-grows with wrapping)
 local last_input           -- last seen compose text, to detect typing
 local cycle                -- Tab-cycling state: { cands, kept, idx } or nil
+
+-- Browse mode (message-granular feed navigation) + selection.
+local browsing = false     -- Shift-Tab entered the feed in browse mode
+local browse_pos = 1       -- index into feed_index of the current entry
+local selected = {}        -- set of message ids; persists until sent/cleared
+local feed_index           -- render_feed's entry index (nil while an overlay shows)
+
+-- Send machinery.
+local pending_jobs = {}    -- dest name -> in-flight job count (bar indicator)
+local prev_liner_key       -- liner to return to on the second Alt-i
+local job_queue = {}       -- finished jobs awaiting main-state processing
 
 -- Forward declarations so mutually-recursive helpers bind to these locals
 -- (function foo() assigns to the in-scope local, not a new global).
@@ -55,6 +68,9 @@ local load_liner, persist_registry, list_liners, do_export, open_help
 local open_olwb, do_migrate, rescan, selftest
 local compose_input, menu_text, bar_text, liner_names, layout_panes
 local sync_compose_size, show_options, set_option
+local cmd_extra, send_to, send_tui, deliver_response, selection_entries
+local issues_draft, issues_file, list_issue_manifests, reset_feed_scroll
+local cycle_step, show_overlay, start_job, drain_jobs
 
 -------------------------------------------------------------------------------
 -- Options / time / ids / feedback
@@ -141,6 +157,8 @@ function open_liner(key)
   if not liner then return nil end
   active_liner = liner
   state.activeLinerId = id
+  -- Opening a liner clears its unread badge (responses have been "seen").
+  if state.unread then state.unread[id] = nil end
   -- Resume the most recent still-open session, if any.
   state.activeSessionId = nil
   for _, s in ipairs(liner.sessions) do
@@ -230,6 +248,533 @@ function do_export(fmt, path)
 end
 
 -------------------------------------------------------------------------------
+-- Send executor (destinations, sessions, TUI mode) + issues pipeline
+-------------------------------------------------------------------------------
+
+local function noop() end
+
+-- Every job command ends with this marker trick: JobStart's onExit callback
+-- carries no exit code, so a shell-level `|| echo` turns non-zero exits
+-- (including command-not-found) into a detectable stderr marker.
+local FAIL_MARKER = "olwb-job-failed"
+
+local function job_failed(stderr_text)
+  return stderr_text:find(FAIL_MARKER, 1, true) ~= nil
+end
+
+-- Job architecture, hard-learned: micro invokes Lua job callbacks on a fresh
+-- gopher-luar thread per invocation, and running real Lua there crashes
+-- micro 2.0.15 nondeterministically (Go-level nil deref in GopherLua's
+-- concat path — hit in the wild with real CLI runs). So jobs here:
+--   1. redirect stdout/stderr to files (no per-chunk callbacks at all);
+--   2. run a push-only onExit (two statements, no string work) that queues
+--      the record and opens a throwaway buffer;
+--   3. rely on buffer.NewBuffer synchronously firing onBufferOpen on the
+--      MAIN Lua state — where drain_jobs runs the real completion logic.
+-- onAnyEvent also drains as a safety net.
+local JOB_DONE_PATH = "olwb://job-done"
+
+-- Start `cmdstr` (optionally with a stdin file that is deleted afterwards)
+-- and hand (stdout, stderr) to `done` on the main state when it finishes.
+function start_job(cmdstr, stdin_path, done)
+  local q = olwb_dest.shell_quote
+  local id = new_id()
+  local outf = olwb_store.dir .. "/job-" .. id .. ".out"
+  local errf = olwb_store.dir .. "/job-" .. id .. ".err"
+  local full = "( " .. cmdstr
+    .. (stdin_path and (" < " .. q(stdin_path)) or "")
+    .. " > " .. q(outf) .. " ) 2> " .. q(errf)
+    .. " || echo " .. FAIL_MARKER .. " >> " .. q(errf)
+  local rec = { out = outf, err = errf, stdin = stdin_path, done = done }
+  shell.JobStart(full, noop, noop, function()
+    job_queue[#job_queue + 1] = rec
+    buffer.NewBuffer("", JOB_DONE_PATH) -- fires onBufferOpen on the main state
+  end)
+end
+
+function drain_jobs()
+  while #job_queue > 0 do
+    local rec = table.remove(job_queue, 1)
+    local stdout = olwb_store.read_file(rec.out) or ""
+    local stderr_text = olwb_store.read_file(rec.err) or ""
+    pcall(function() goos.Remove(rec.out) end)
+    pcall(function() goos.Remove(rec.err) end)
+    if rec.stdin then pcall(function() goos.Remove(rec.stdin) end) end
+    rec.done(stdout, stderr_text)
+  end
+end
+
+-- The job-completion trampoline target (see start_job). Must be module-scope
+-- so micro finds it; ignores every buffer except the throwaway ones.
+function onBufferOpen(buf)
+  local ok, path = pcall(function() return buf.Path end)
+  if not ok or path ~= JOB_DONE_PATH then return end
+  pcall(function() buf:Close() end)
+  drain_jobs()
+end
+
+-- Last few stderr lines for an error bar message (the marker itself is
+-- filtered with a plain find — it contains pattern-magic hyphens).
+local function stderr_tail(text)
+  local lines = {}
+  for line in ((text or "") .. "\n"):gmatch("(.-)\n") do
+    if line:match("%S") and not line:find(FAIL_MARKER, 1, true) then
+      lines[#lines + 1] = line
+    end
+  end
+  local from = math.max(1, #lines - 2)
+  local out = table.concat(lines, " | ", from)
+  if out == "" then out = "(no stderr)" end
+  if #out > 160 then out = out:sub(1, 157) .. "…" end
+  return out
+end
+
+local function find_dest_state(name)
+  for _, d in ipairs(state.destinations or {}) do
+    if d.name == name then return d end
+  end
+  return nil
+end
+
+local function selection_count()
+  local n = 0
+  for _ in pairs(selected) do n = n + 1 end
+  return n
+end
+
+-- The entries a send/draft operates on: the selected messages in feed order,
+-- or — when nothing is selected — the whole current scope (respecting the
+-- active filter).
+function selection_entries()
+  if not active_liner then return nil, "no active liner (use /new or /open)" end
+  local entries = olwb_model.flatten_desc(active_liner, {
+    include_direct = true,
+    filter = state.filter,
+  })
+  if selection_count() == 0 then return entries end
+  local chosen = {}
+  for _, e in ipairs(entries) do
+    if selected[e.message.id] then chosen[#chosen + 1] = e end
+  end
+  return chosen
+end
+
+-- Land a response in a liner by name (load-or-create) WITHOUT disturbing the
+-- active liner — unless the target IS active, then mutate in place. Appends
+-- as a direct message so no session state is touched. Bumps the unread badge
+-- for non-active targets. Returns the target liner id.
+function deliver_response(into_name, content, label)
+  if not into_name or into_name == "" then return nil end
+  local id = nil
+  for lid, meta in pairs(state.liners) do
+    if meta.name == into_name then id = lid break end
+  end
+  local target, is_active
+  if active_liner and (active_liner.id == id
+      or (not id and active_liner.metadata.name == into_name)) then
+    target = active_liner
+    is_active = true
+  elseif id then
+    target = load_liner(id)
+  end
+  if not target then
+    target = olwb_model.new_liner(new_id(), into_name, "")
+  end
+  local msg = olwb_model.new_message(new_id(), content, now_ms(),
+    label and { label } or {})
+  target.directMessages = target.directMessages or {}
+  target.directMessages[#target.directMessages + 1] = msg
+  olwb_store.save_liner(target)
+  persist_registry(target)
+  if not is_active then
+    state.unread = state.unread or {}
+    state.unread[target.id] = (state.unread[target.id] or 0) + 1
+  end
+  olwb_store.save_state(state)
+  rerender() -- feed (if target is active) and the bar badge/count
+  return target.id
+end
+
+-- Auto-detect a terminal for TUI sends: $TERMINAL first, then common
+-- emulators (with their exec flag where one is needed).
+local function detect_terminal()
+  local t = goos.Getenv("TERMINAL")
+  if t ~= nil and t ~= "" then return t end
+  local cands = {
+    { "konsole", "konsole -e" },
+    { "foot", "foot" },
+    { "alacritty", "alacritty -e" },
+    { "kitty", "kitty" },
+    { "xterm", "xterm -e" },
+  }
+  for _, c in ipairs(cands) do
+    local _, e = shell.ExecCommand("sh", "-c", "command -v " .. c[1])
+    if e == nil then return c[2] end
+  end
+  return nil
+end
+
+-- /send <dest> tui: payload to a file, adapter builds the interactive
+-- command, spawned detached in a new terminal window. micro keeps running.
+function send_tui(d, payload, skey, n)
+  if not state.termcmd or state.termcmd == "" then
+    local t = detect_terminal()
+    if not t then
+      err('no terminal found — /set termcmd "<cmd>"')
+      return
+    end
+    state.termcmd = t
+    olwb_store.save_state(state)
+  end
+  local id = new_id()
+  local ppath = olwb_store.dir .. "/tui-" .. id .. ".md"
+  if not olwb_store.write_file_atomic(ppath, payload) then
+    err("could not write payload file")
+    return
+  end
+  local sid = (state.dest_sessions or {})[skey]
+  local tcmd, terr = olwb_dest.tui(d.kind, sid, ppath)
+  if not tcmd then err(tostring(terr)) return end
+  -- A launcher script sidesteps quote-nesting through the terminal emulator;
+  -- only olwb-generated paths appear on the spawn command line.
+  local lpath = olwb_store.dir .. "/tui-" .. id .. ".sh"
+  olwb_store.write_file_atomic(lpath, "#!/bin/sh\nexec " .. tcmd .. "\n")
+  local spawn = "setsid " .. state.termcmd .. " sh "
+    .. olwb_dest.shell_quote(lpath) .. " >/dev/null 2>&1 &"
+  shell.JobStart(spawn, noop, noop, noop)
+  selected = {}
+  rerender()
+  info("opened " .. d.name .. " in a terminal ("
+    .. (sid and "resumed session" or "fresh session") .. ")")
+end
+
+-- Headless /send. is_retry guards the one automatic fresh retry after a
+-- resumed session fails (C3's stale-session rule).
+function send_to(name, mode, is_retry)
+  local d = find_dest_state(name)
+  if not d then
+    err("no destination '" .. tostring(name) .. "' (/dest add, /dest lists)")
+    return
+  end
+  local entries, serr = selection_entries()
+  if not entries then err(serr) return end
+  if #entries == 0 then err("nothing to send (empty scope)") return end
+  local payload = olwb_render.render_selection_md(active_liner, entries,
+    { fmt_time = fmt_time })
+  local n = #entries
+  local source_name = active_liner.metadata.name
+  if source_name == "" then source_name = olwb_render.short_id(active_liner.id) end
+  local skey = d.name .. "|" .. active_liner.id
+
+  if mode == "tui" then
+    if not d.kind then
+      err("destination '" .. name .. "' is a plain pipe — tui needs kind claude|codex|opencode (/dest kind)")
+      return
+    end
+    send_tui(d, payload, skey, n)
+    return
+  end
+
+  local cmdstr = d.cmd
+  local had_session = false
+  if d.kind then
+    local sid = (state.dest_sessions or {})[skey]
+    had_session = sid ~= nil
+    local wrapped, werr = olwb_dest.wrap(d.kind, d.cmd, sid)
+    if not wrapped then err(tostring(werr)) return end
+    cmdstr = wrapped
+  end
+
+  local tmp = olwb_store.dir .. "/tmp-send-" .. new_id()
+  if not olwb_store.write_file_atomic(tmp, payload) then
+    err("could not write payload file")
+    return
+  end
+
+  pending_jobs[d.name] = (pending_jobs[d.name] or 0) + 1
+  start_job(cmdstr, tmp,
+    function(stdout, stderr_text)
+      pending_jobs[d.name] = math.max(0, (pending_jobs[d.name] or 1) - 1)
+      local failed = job_failed(stderr_text)
+      local response_text
+      if d.kind then
+        if failed and had_session and not is_retry then
+          -- Stale session: forget it and retry exactly once, fresh.
+          state.dest_sessions[skey] = nil
+          olwb_store.save_state(state)
+          info(d.name .. ": stored session failed, retrying fresh…")
+          send_to(name, mode, true)
+          return
+        end
+        if failed then
+          err(d.name .. " failed: " .. stderr_tail(stderr_text))
+          rerender()
+          return
+        end
+        local parsed, perr = olwb_dest.parse(d.kind, stdout)
+        if not parsed then
+          err(d.name .. ": " .. tostring(perr))
+          rerender()
+          return
+        end
+        if parsed.session_id then
+          state.dest_sessions = state.dest_sessions or {}
+          state.dest_sessions[skey] = parsed.session_id
+          olwb_store.save_state(state)
+        end
+        response_text = parsed.text
+      else
+        if failed then
+          err(d.name .. " failed: " .. stderr_tail(stderr_text))
+          rerender()
+          return
+        end
+        response_text = stdout
+      end
+      if d.into and d.into ~= "" then
+        local prov = "↩ " .. n .. " note" .. (n == 1 and "" or "s")
+          .. " from " .. source_name
+        deliver_response(d.into, prov .. "\n" .. response_text, d.name)
+      end
+      selected = {}
+      rerender()
+      info("sent " .. n .. " message(s) to " .. d.name)
+    end)
+  rerender() -- bar shows "<dest> working…"
+  info("sending " .. n .. " message(s) to " .. d.name .. "…")
+end
+
+-------------------------------------------------------------------------------
+-- Issues pipeline (stage 1 draft, stage 2 file; stage 3 is out of scope)
+-------------------------------------------------------------------------------
+
+function list_issue_manifests()
+  local out = {}
+  for _, p in ipairs(olwb_store.glob(olwb_store.issues_dir() .. "/*.json")) do
+    local s = olwb_store.read_file(p)
+    if s then
+      local ok, m = pcall(olwb_json.decode, s)
+      if ok and type(m) == "table" and m.id then out[#out + 1] = m end
+    end
+  end
+  table.sort(out, function(a, b)
+    return (a.created_ms or 0) > (b.created_ms or 0)
+  end)
+  return out
+end
+
+local function manifest_path(id)
+  return olwb_store.issues_dir() .. "/" .. id .. ".json"
+end
+
+local function save_manifest(m)
+  return olwb_store.write_file_atomic(manifest_path(m.id), olwb_json.encode(m))
+end
+
+-- Resolve /issues draft's target: explicit alias wins; a single configured
+-- repo is the default; otherwise the aliases are listed. No inference magic.
+local function resolve_issue_repo(alias)
+  local repos = state.issue_repos or {}
+  if alias and alias ~= "" then
+    for _, r in ipairs(repos) do
+      if r.alias == alias then return r end
+    end
+    return nil, "no repo alias '" .. alias .. "' (/issues repo add)"
+  end
+  if #repos == 1 then return repos[1] end
+  if #repos == 0 then
+    return nil, "no repos configured — /issues repo add <alias> <owner/repo> [path]"
+  end
+  local names = {}
+  for _, r in ipairs(repos) do names[#names + 1] = r.alias end
+  return nil, "several repos configured — /issues draft <"
+    .. table.concat(names, "|") .. ">"
+end
+
+-- Add a label to specific messages in a (possibly non-active) liner — the
+-- stage-2 #filed marking. Same don't-disturb rule as deliver_response.
+local function label_messages(liner_id, message_ids, label)
+  if not liner_id or not message_ids then return end
+  local target, is_active
+  if active_liner and active_liner.id == liner_id then
+    target = active_liner
+    is_active = true
+  else
+    target = load_liner(liner_id)
+  end
+  if not target then return end
+  local want = {}
+  for _, id in ipairs(message_ids) do want[id] = true end
+  local function mark(msgs)
+    for _, m in ipairs(msgs or {}) do
+      if want[m.id] then
+        m.metadata = m.metadata or {}
+        m.metadata.labels = m.metadata.labels or {}
+        olwb_model.add_label(m.metadata.labels, label)
+      end
+    end
+  end
+  for _, s in ipairs(target.sessions or {}) do mark(s.messages) end
+  mark(target.directMessages)
+  olwb_store.save_liner(target)
+  persist_registry(target)
+  olwb_store.save_state(state)
+  if is_active then rerender() end
+end
+
+-- Stage 1: selection → model → validated drafts → gh script + manifest +
+-- review summary. Ends with an instruction, never an action: the review gate.
+function issues_draft(alias)
+  local target, rerr = resolve_issue_repo(alias)
+  if not target then err(rerr) return end
+  local entries, serr = selection_entries()
+  if not entries then err(serr) return end
+  if #entries == 0 then err("nothing to draft from (empty scope)") return end
+
+  local payload = olwb_render.render_selection_md(active_liner, entries,
+    { fmt_time = fmt_time })
+  local source_name = active_liner.metadata.name
+  if source_name == "" then source_name = olwb_render.short_id(active_liner.id) end
+  local source_liner_id = active_liner.id
+  local message_ids = {}
+  for _, e in ipairs(entries) do message_ids[#message_ids + 1] = e.message.id end
+
+  -- Prompt template: seed the embedded copy to the datadir once; from then on
+  -- the file wins, so the user can tune it without touching the plugin.
+  local tpath = olwb_store.dir .. "/issues-prompt.md"
+  if not olwb_store.exists(tpath) then
+    olwb_store.write_file_atomic(tpath, OLWB_ISSUES_PROMPT)
+  end
+  local template = olwb_store.read_file(tpath) or OLWB_ISSUES_PROMPT
+
+  -- Best-effort repo context from a local checkout; never fatal.
+  local repo_context = nil
+  if target.path and target.path ~= "" then
+    pcall(function()
+      repo_context = olwb_issues.build_repo_context(function(p)
+        return olwb_store.read_file(p)
+      end, target.path)
+    end)
+  end
+
+  local prompt = olwb_issues.build_prompt({
+    template = template,
+    repo = target.repo,
+    repo_context = repo_context,
+    payload = payload,
+  })
+
+  local draft_id = os.date("%Y%m%d-%H%M%S")
+  local tmp = olwb_store.issues_dir() .. "/tmp-" .. draft_id .. "-prompt.md"
+  if not olwb_store.write_file_atomic(tmp, prompt) then
+    err("could not write prompt file")
+    return
+  end
+  local mcmd = state.issues_model_cmd or "claude -p"
+
+  pending_jobs["issues"] = (pending_jobs["issues"] or 0) + 1
+  start_job(mcmd, tmp,
+    function(stdout, stderr_text)
+      pending_jobs["issues"] = math.max(0, (pending_jobs["issues"] or 1) - 1)
+      if job_failed(stderr_text) then
+        err("issues draft failed: " .. stderr_tail(stderr_text))
+        rerender()
+        return
+      end
+      local drafts, perrs = olwb_issues.parse_response(stdout)
+      if not drafts then
+        local rawpath = olwb_store.issues_dir() .. "/" .. draft_id .. ".raw.txt"
+        olwb_store.write_file_atomic(rawpath, stdout or "")
+        err("draft rejected: " .. table.concat(perrs or {}, "; ")
+          .. " — raw response: " .. rawpath)
+        rerender()
+        return
+      end
+      local script = olwb_issues.render_script(target.repo, drafts,
+        { id = draft_id, source = source_name })
+      local spath = olwb_store.issues_dir() .. "/" .. draft_id .. ".sh"
+      olwb_store.write_file_atomic(spath, script)
+      save_manifest({
+        id = draft_id,
+        repo = target.repo,
+        alias = target.alias,
+        script = spath,
+        count = #drafts,
+        status = "drafted",
+        created_ms = now_ms(),
+        source_liner_id = source_liner_id,
+        message_ids = message_ids,
+      })
+      local summary = olwb_issues.render_draft_md(draft_id, target.repo,
+        drafts, spath)
+      deliver_response("issues", summary, "draft")
+      selected = {}
+      rerender()
+      info("drafted " .. #drafts .. " issue(s) → review " .. draft_id
+        .. ".sh, then /issues file " .. draft_id)
+    end)
+  rerender()
+  info("drafting issues via " .. mcmd .. "…")
+end
+
+-- Stage 2: run the reviewed gh script. Never called automatically.
+function issues_file(id)
+  local manifest
+  if id == "latest" then
+    manifest = list_issue_manifests()[1]
+    if not manifest then err("no drafts yet — /issues draft") return end
+  else
+    local s = olwb_store.read_file(manifest_path(id))
+    if s then
+      local ok, m = pcall(olwb_json.decode, s)
+      if ok and type(m) == "table" then manifest = m end
+    end
+    if not manifest then
+      err("no draft '" .. tostring(id) .. "' (/issues list)")
+      return
+    end
+  end
+  if manifest.status ~= "drafted" then
+    err("draft " .. manifest.id .. " already filed"
+      .. (manifest.filed_ms and (" " .. fmt_time(manifest.filed_ms)) or ""))
+    return
+  end
+  pending_jobs["issues"] = (pending_jobs["issues"] or 0) + 1
+  start_job("sh " .. olwb_dest.shell_quote(manifest.script), nil,
+    function(stdout, stderr_text)
+      pending_jobs["issues"] = math.max(0, (pending_jobs["issues"] or 1) - 1)
+      local urls = {}
+      for line in ((stdout or "") .. "\n"):gmatch("(.-)\n") do
+        local url = line:match("^%s*(https?://%S+)%s*$")
+        if url then urls[#urls + 1] = url end
+      end
+      if job_failed(stderr_text) or #urls == 0 then
+        -- set -e means partial filing is possible; record what got through
+        -- so a manual re-run can be reasoned about. Status stays drafted;
+        -- never auto-retry (that could double-file).
+        if #urls > 0 then manifest.filed_urls = urls end
+        save_manifest(manifest)
+        err("filing failed (" .. #urls .. " issue(s) got through, status stays drafted): "
+          .. stderr_tail(stderr_text))
+        rerender()
+        return
+      end
+      manifest.status = "filed"
+      manifest.filed_ms = now_ms()
+      manifest.filed_urls = urls
+      save_manifest(manifest)
+      deliver_response("issues",
+        "filed " .. #urls .. " issue(s) on " .. manifest.repo .. "\n"
+        .. table.concat(urls, "\n"), "filed")
+      label_messages(manifest.source_liner_id, manifest.message_ids, "filed")
+      rerender()
+      info("filed " .. #urls .. " issue(s) on " .. manifest.repo)
+    end)
+  rerender()
+  info("filing " .. (manifest.count or "?") .. " issue(s) on " .. manifest.repo .. "…")
+end
+
+-------------------------------------------------------------------------------
 -- Rendering into the feed buffer
 -------------------------------------------------------------------------------
 
@@ -245,11 +790,13 @@ function feed_text()
     local pw = feed_pane:GetView().Width - 1 - 2 * #PAD
     if pw > 0 and pw < w then w = pw end
   end)
+  -- Second return: the entry index browse mode navigates by.
   return olwb_render.render_feed(active_liner, state, {
     fmt_time = fmt_time,
     rule_width = w,
     filter = state.filter,
     include_direct = true,
+    selected = selected,
   })
 end
 
@@ -283,6 +830,19 @@ function liner_names()
     end
   end
   return out
+end
+
+-- Dynamic completion pools handed to olwb_cmd.candidates everywhere.
+function cmd_extra()
+  local dests = {}
+  for _, d in ipairs(state and state.destinations or {}) do
+    dests[#dests + 1] = d.name
+  end
+  local repos = {}
+  for _, r in ipairs(state and state.issue_repos or {}) do
+    repos[#repos + 1] = r.alias
+  end
+  return { liners = liner_names(), dests = dests, repos = repos }
 end
 
 -- The /? help menu, filtered live by the verb being typed. Shown in the feed
@@ -347,7 +907,7 @@ function menu_text(input)
   if cycle and cycle.kept ~= "/" then
     cands, sel, kept = cycle.cands, cycle.idx, cycle.kept
   elseif not cycle then
-    local c, _, k = olwb_cmd.candidates(input or "", { liners = liner_names() })
+    local c, _, k = olwb_cmd.candidates(input or "", cmd_extra())
     if k ~= "/" then cands, kept = c, k end
   end
   if cands and #cands > 0 then
@@ -418,13 +978,21 @@ function liner_detail_lines(key)
 end
 
 -- One-line shortcut reference, trimmed to the pane width segment by segment.
+-- Browse mode swaps in its own key list.
 local function shortcuts_line()
   local width = 76
   pcall(function() width = bar_pane:GetView().Width - 2 * #PAD end)
-  local segs = {
-    "Enter submits", "/? commands", "Tab/↑↓ cycle",
-    "Space details", "Alt-m input",
-  }
+  local segs
+  if browsing then
+    segs = {
+      "↑↓ jump", "Space select", "a all", "Enter send", "Shift-Tab back",
+    }
+  else
+    segs = {
+      "Enter submits", "/? commands", "Tab/↑↓ cycle",
+      "Space details", "Alt-m input",
+    }
+  end
   local out = segs[1]
   for i = 2, #segs do
     local trial = out .. "  ·  " .. segs[i]
@@ -452,6 +1020,22 @@ function bar_text()
       .. (#state.activeLabels == 1 and "" or "s")
   end
   if state and state.filter then extras[#extras + 1] = "filtered" end
+  local selcount = 0
+  for _ in pairs(selected) do selcount = selcount + 1 end
+  if selcount > 0 then extras[#extras + 1] = selcount .. " selected" end
+  for name, n in pairs(pending_jobs) do
+    if n > 0 then extras[#extras + 1] = name .. " working…" end
+  end
+  if state and state.unread then
+    for lid, n in pairs(state.unread) do
+      if type(n) == "number" and n > 0 then
+        local meta = state.liners[lid]
+        local nm = (meta and meta.name ~= "" and meta.name)
+          or olwb_render.short_id(lid)
+        extras[#extras + 1] = nm .. ": " .. n .. " new"
+      end
+    end
+  end
   if #extras > 0 then ln = ln .. "  ·  " .. table.concat(extras, " · ") end
   return "\n" .. pad_lines(shortcuts_line()
     .. "\n\nLiner: " .. ln .. "\nSession: " .. sn)
@@ -465,7 +1049,11 @@ local function options_text()
   local rows = {}
   local maxu, maxd = 0, 0
   for _, o in ipairs(OPTION_DOCS) do
-    local u = o[1] .. " = " .. tostring(opt(o[1]))
+    -- termcmd lives in state.json (it's per-datadir), not micro settings.
+    local v = o[1] == "termcmd"
+      and (state and state.termcmd or "(auto-detected on first tui send)")
+      or tostring(opt(o[1]))
+    local u = o[1] .. " = " .. v
     rows[#rows + 1] = { u = u, d = o[2] }
     if #u > maxu then maxu = #u end
     if #o[2] > maxd then maxd = #o[2] end
@@ -482,6 +1070,66 @@ local function options_text()
       lines[#lines + 1] = "  " .. r.u
       lines[#lines + 1] = "      " .. r.d
     end
+  end
+  return table.concat(lines, "\n")
+end
+
+-- The /dest overlay: configured destinations and how to manage them.
+local function dests_text()
+  local lines = {
+    "destinations — /send <name> sends the selection (or current scope)", "",
+  }
+  local ds = (state and state.destinations) or {}
+  if #ds == 0 then
+    lines[#lines + 1] = "  (none — /dest add <name> <shell command…>)"
+  end
+  local maxn = 0
+  for _, d in ipairs(ds) do if #d.name > maxn then maxn = #d.name end end
+  for _, d in ipairs(ds) do
+    local bits = { d.cmd }
+    if d.kind then bits[#bits + 1] = "kind=" .. d.kind end
+    if d.into and d.into ~= "" then bits[#bits + 1] = "→ " .. d.into end
+    lines[#lines + 1] = "  " .. d.name
+      .. string.rep(" ", maxn - #d.name + 3) .. table.concat(bits, "  ·  ")
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "  /dest add <name> <cmd…> · rm <name> · into <name> <liner|->"
+  lines[#lines + 1] = "  /dest kind <name> <claude|codex|opencode|-> · session list|clear <name>"
+  return table.concat(lines, "\n")
+end
+
+-- The /dest session list overlay: stored dest|liner → session mappings.
+local function sessions_text()
+  local lines = {
+    "destination sessions — /dest session clear <name> forgets one", "",
+  }
+  local any = false
+  for key, sid in pairs((state and state.dest_sessions) or {}) do
+    any = true
+    local dname, lid = key:match("^(.-)|(.*)$")
+    local meta = lid and state.liners[lid]
+    local lname = (meta and meta.name ~= "" and meta.name)
+      or olwb_render.short_id(lid or "")
+    lines[#lines + 1] = string.format("  %-14s %-18s %s",
+      dname or key, lname, tostring(sid))
+  end
+  if not any then lines[#lines + 1] = "  (no stored sessions yet)" end
+  return table.concat(lines, "\n")
+end
+
+-- The /issues list overlay: drafts from the manifest dir, newest first.
+local function issues_list_text()
+  local lines = {
+    "issue drafts — review the script, then /issues file <id|latest>", "",
+  }
+  local ms = list_issue_manifests()
+  if #ms == 0 then
+    lines[#lines + 1] = "  (none — select messages, then /issues draft [<repo>])"
+  end
+  for _, m in ipairs(ms) do
+    lines[#lines + 1] = string.format("  %-16s %-24s %2d issue(s)  %-8s %s",
+      tostring(m.id), tostring(m.repo), m.count or 0,
+      tostring(m.status), tostring(m.script))
   end
   return table.concat(lines, "\n")
 end
@@ -505,20 +1153,34 @@ function rerender()
 
     local input = compose_input()
     local text
+    feed_index = nil
     if olwb_cmd.is_command(input) then
       text = menu_text(input)   -- live command menu while typing /…
-    elseif options_open then
+    elseif overlay_kind == "options" then
       text = options_text()
-    elseif help_open then
+    elseif overlay_kind == "help" then
       text = menu_text("")
+    elseif overlay_kind == "dests" then
+      text = dests_text()
+    elseif overlay_kind == "sessions" then
+      text = sessions_text()
+    elseif overlay_kind == "issues" then
+      text = issues_list_text()
     else
-      text = feed_text()
+      text, feed_index = feed_text()
     end
     set_buffer_text(buf, pad_lines(text))
 
-    -- Pin the view to the top: new entries appear at position 0 (right under
-    -- the compose line) and push the rest down.
-    feed_pane.Cursor:GotoLoc(buffer.Loc(0, 0))
+    -- While browsing, restore the cursor to the current entry (so Space
+    -- doesn't yank the view); otherwise pin the view to the top, where new
+    -- entries appear (right under the compose line).
+    if browsing and feed_index and #feed_index > 0 then
+      if browse_pos > #feed_index then browse_pos = #feed_index end
+      if browse_pos < 1 then browse_pos = 1 end
+      feed_pane.Cursor:GotoLoc(buffer.Loc(0, feed_index[browse_pos].start))
+    else
+      feed_pane.Cursor:GotoLoc(buffer.Loc(0, 0))
+    end
     pcall(function() feed_pane:Relocate() end)
   end)
   pcall(function()
@@ -566,6 +1228,13 @@ function build_ctx()
     open_help = open_help,
     show_options = function() show_options() end,
     set_option = function(n, v) return set_option(n, v) end,
+    dest = olwb_dest,
+    send_to = function(name, mode) send_to(name, mode) end,
+    show_dests = function() show_overlay("dests") end,
+    show_sessions = function() show_overlay("sessions") end,
+    show_issues_list = function() show_overlay("issues") end,
+    issues_draft = function(alias) issues_draft(alias) end,
+    issues_file = function(id) issues_file(id) end,
   }
 end
 
@@ -598,15 +1267,19 @@ end
 -- /? and /help: toggle the in-feed command menu (no extra panes, nothing to
 -- close — it clears as soon as you start typing a normal line).
 function open_help()
-  help_open = not help_open
-  options_open = false
+  overlay_kind = overlay_kind ~= "help" and "help" or nil
   rerender()
 end
 
--- /set with no value: show the options overlay the same way.
+-- /set with no value (and /dest, /dest session list, /issues list): show an
+-- overlay in the feed pane the same way.
 function show_options()
-  options_open = true
-  help_open = false
+  overlay_kind = "options"
+  rerender()
+end
+
+function show_overlay(kind)
+  overlay_kind = kind
   rerender()
 end
 
@@ -619,6 +1292,14 @@ function set_option(name, value)
   end
   if not known then
     return false, "unknown option '" .. tostring(name) .. "' (bare /set lists them)"
+  end
+  if name == "termcmd" then
+    -- Lives in state.json, not micro's settings machinery; strip the quotes
+    -- the usage line suggests around multi-word commands.
+    state.termcmd = tostring(value):gsub('^"(.*)"$', "%1")
+    olwb_store.save_state(state)
+    rerender()
+    return true
   end
   local ok, e = pcall(function()
     local err = config.SetGlobalOption("olwb." .. name, value)
@@ -783,7 +1464,7 @@ function open_olwb()
   bar_pane = feed_pane:HSplitBuf(bbuf)
 
   compose_rows = math.max(1, math.floor(tonumber(opt("composesize")) or 1))
-  help_open = false
+  overlay_kind = nil
   layout_panes()
   focus(compose_pane)
   ui_open = true
@@ -913,8 +1594,23 @@ function preInsertNewline(bp)
   if not bp or not bp.Buf then return true end
   local path = bp.Buf.Path
   if path == FEED_PATH or path == TITLE_PATH or path == BAR_PATH then
+    -- Enter while browsing opens the destination picker: pre-fill "/send "
+    -- and start the Tab-cycle so the candidates appear immediately. Falls
+    -- back to a plain return-to-line when there is nothing to send with.
+    local pick = path == FEED_PATH and browsing
+      and feed_index and #feed_index > 0
+      and state.destinations and #state.destinations > 0
     if path == FEED_PATH then reset_feed_scroll() end
     focus(compose_pane) -- Enter in the chrome just returns to the one line
+    if pick then
+      pcall(function()
+        local buf = compose_pane.Buf
+        set_buffer_text(buf, "/send ")
+        compose_pane.Cursor:GotoLoc(
+          buffer.Loc(util.CharacterCountInString(buf:Line(0)), 0))
+      end)
+      cycle_step(compose_pane, 1)
+    end
     return false
   end
   if path ~= COMPOSE_PATH then
@@ -929,8 +1625,7 @@ function preInsertNewline(bp)
   bp.Buf:Remove(buffer.Loc(0, 0), buffer.Loc(util.CharacterCountInString(last), n - 1))
   bp.Cursor:GotoLoc(buffer.Loc(0, 0))
 
-  help_open = false
-  options_open = false
+  overlay_kind = nil
   cycle = nil
   if olwb_cmd.is_command(text) then
     olwb_cmd.dispatch(build_ctx(), text)
@@ -944,12 +1639,12 @@ function preInsertNewline(bp)
 end
 
 -- Tab / Shift-Tab in the compose line cycle through the completion options
--- (verbs, subverbs, liner names); the menu marks the selection and the line
--- is filled in — Enter runs it. Typing anything resets the cycle.
-local function cycle_step(bp, dir)
+-- (verbs, subverbs, liner/destination/repo names); the menu marks the
+-- selection and the line is filled in — Enter runs it. Typing resets the
+-- cycle. (Bare `function`: assigns the forward-declared local.)
+function cycle_step(bp, dir)
   if not cycle then
-    local cands, _, kept = olwb_cmd.candidates(compose_input(),
-      { liners = liner_names() })
+    local cands, _, kept = olwb_cmd.candidates(compose_input(), cmd_extra())
     if #cands == 0 then return end
     cycle = { cands = cands, kept = kept, idx = 0 }
   end
@@ -965,14 +1660,20 @@ local function cycle_step(bp, dir)
   rerender()
 end
 
--- Leaving the feed puts its scroll position back at the top (newest entry).
-local function reset_feed_scroll()
+-- Leaving the feed puts its scroll position back at the top (newest entry)
+-- and ends browse mode. The selection deliberately survives (so /send works
+-- from the one line); it clears on a successful send or via `a`.
+function reset_feed_scroll()
+  local was_browsing = browsing
+  browsing = false
+  pcall(function() feed_pane.Buf:SetOption("cursorline", "false") end)
   pcall(function()
     feed_pane.Cursor:GotoLoc(buffer.Loc(0, 0))
     local v = feed_pane:GetView()
     v.StartLine.Line = 0
     v.StartLine.Row = 0
   end)
+  if was_browsing then rerender() end -- bar swaps its shortcut line back
 end
 
 function preInsertTab(bp)
@@ -988,9 +1689,41 @@ function preInsertTab(bp)
   return false
 end
 
+-- Enter the feed in browse mode: message-granular navigation with the
+-- current entry's first line highlighted. Plain focus when the feed is empty
+-- or an overlay is showing (feed_index is nil then).
+local function enter_browse()
+  if overlay_kind then -- browsing is about the feed; dismiss any overlay
+    overlay_kind = nil
+    rerender()
+  end
+  focus(feed_pane)
+  if not feed_index or #feed_index == 0 then return end
+  browsing = true
+  browse_pos = 1
+  pcall(function() feed_pane.Buf:SetOption("cursorline", "true") end)
+  pcall(function()
+    feed_pane.Cursor:GotoLoc(buffer.Loc(0, feed_index[browse_pos].start))
+    feed_pane:Relocate()
+  end)
+  rerender() -- bar swaps to the browse shortcut line
+end
+
+-- Move the browse cursor entry-by-entry (not line-by-line).
+local function browse_move(dir)
+  if not feed_index or #feed_index == 0 then return end
+  browse_pos = browse_pos + dir
+  if browse_pos < 1 then browse_pos = 1 end
+  if browse_pos > #feed_index then browse_pos = #feed_index end
+  pcall(function()
+    feed_pane.Cursor:GotoLoc(buffer.Loc(0, feed_index[browse_pos].start))
+    feed_pane:Relocate()
+  end)
+end
+
 -- Shift-Tab: cycle backwards while a /command is typed; otherwise toggle
--- between the one line and the feed (arrows scroll there; leaving snaps the
--- scroll back to the top).
+-- between the one line and the feed's browse mode (leaving snaps the scroll
+-- back to the top).
 function preOutdentSelection(bp)
   if not bp or not bp.Buf then return true end
   local p = bp.Buf.Path
@@ -1003,21 +1736,38 @@ function preOutdentSelection(bp)
   if olwb_cmd.is_command(compose_input()) then
     cycle_step(bp, -1)
   else
-    focus(feed_pane)
+    enter_browse()
   end
   return false
 end
 
--- Up/Down also walk the options while a slash command is being typed.
+-- Up/Down walk the options while a slash command is being typed, and jump
+-- message-to-message while browsing the feed.
 function preCursorUp(bp)
-  if not bp or not bp.Buf or bp.Buf.Path ~= COMPOSE_PATH then return true end
+  if not bp or not bp.Buf then return true end
+  if bp.Buf.Path == FEED_PATH then
+    if browsing and feed_index and #feed_index > 0 then
+      browse_move(-1)
+      return false
+    end
+    return true
+  end
+  if bp.Buf.Path ~= COMPOSE_PATH then return true end
   if not olwb_cmd.is_command(compose_input()) then return true end
   cycle_step(bp, -1)
   return false
 end
 
 function preCursorDown(bp)
-  if not bp or not bp.Buf or bp.Buf.Path ~= COMPOSE_PATH then return true end
+  if not bp or not bp.Buf then return true end
+  if bp.Buf.Path == FEED_PATH then
+    if browsing and feed_index and #feed_index > 0 then
+      browse_move(1)
+      return false
+    end
+    return true
+  end
+  if bp.Buf.Path ~= COMPOSE_PATH then return true end
   if not olwb_cmd.is_command(compose_input()) then return true end
   cycle_step(bp, 1)
   return false
@@ -1029,6 +1779,31 @@ end
 function preRune(bp, r)
   if not ui_open or not bp or not bp.Buf then return true end
   local p = bp.Buf.Path
+  -- Browse-mode keys: Space toggles the entry under the cursor in the
+  -- selection, `a` selects the whole scope (or clears it when everything is
+  -- already selected). Any other rune falls through to the compose bounce.
+  if p == FEED_PATH and browsing and feed_index and #feed_index > 0 then
+    if r == " " then
+      local row = feed_index[browse_pos]
+      if row and row.id then
+        selected[row.id] = not selected[row.id] and true or nil
+        rerender()
+      end
+      return false
+    elseif r == "a" then
+      local all = true
+      for _, row in ipairs(feed_index) do
+        if not selected[row.id] then all = false break end
+      end
+      if all then
+        selected = {}
+      else
+        for _, row in ipairs(feed_index) do selected[row.id] = true end
+      end
+      rerender()
+      return false
+    end
+  end
   if p == FEED_PATH or p == TITLE_PATH or p == BAR_PATH then
     if p == FEED_PATH then reset_feed_scroll() end
     pcall(function()
@@ -1075,6 +1850,7 @@ function preScrollDown(bp) return scroll_guard(bp) end
 -- auto-grow the compose line, and refresh the live menu as input changes.
 local last_dims
 function onAnyEvent()
+  drain_jobs() -- safety net for job completions (see start_job)
   if not ui_open or not compose_pane then return end
   pcall(function()
     if compose_pane.Buf.Path ~= COMPOSE_PATH then return end
@@ -1093,7 +1869,7 @@ function onAnyEvent()
 
     local input = compose_input()
     if input == last_input then return end
-    if input ~= "" then help_open = false; options_open = false end
+    if input ~= "" then overlay_kind = nil end
     last_input = input
     cycle = nil -- the user typed; drop the Tab-cycle state
     sync_compose_size()
@@ -1133,6 +1909,52 @@ function key_compose(bp)
   return true
 end
 
+-- Alt-i: toggle active liner ↔ the default inbox liner (where destination
+-- responses land), remembering where you came from so a second Alt-i
+-- returns. Creates inbox on first use.
+function key_inbox(bp)
+  if not ui_open then open_olwb() end
+  save_active()
+  if active_liner and active_liner.metadata.name == "inbox" then
+    if prev_liner_key and open_liner(prev_liner_key) then
+      info("back to " .. (active_liner.metadata.name ~= ""
+        and active_liner.metadata.name or olwb_render.short_id(active_liner.id)))
+    end
+  else
+    prev_liner_key = active_liner and active_liner.id or nil
+    if not open_liner("inbox") then create_liner("inbox", "") end
+    info("inbox")
+  end
+  rerender()
+  return true
+end
+
+-- Seed the destination presets once (only when the key is absent, so user
+-- edits and removals stick). Clipboard tooling is probed at seed time.
+local function seed_destinations()
+  local clip = "wl-copy"
+  local _, e = shell.ExecCommand("sh", "-c", "command -v wl-copy")
+  if e ~= nil then
+    local _, e2 = shell.ExecCommand("sh", "-c", "command -v xclip")
+    if e2 == nil then clip = "xclip -selection clipboard" end
+  end
+  local prompt = "Summarize these notes: group brainstormed ideas, "
+    .. "extract action items and open questions."
+  return {
+    { name = "claude", cmd = 'claude -p "' .. prompt .. '"',
+      into = "inbox", kind = "claude" },
+    { name = "codex", cmd = "codex exec", into = "inbox", kind = "codex" },
+    { name = "opencode", cmd = 'opencode run "' .. prompt .. '"',
+      into = "inbox", kind = "opencode" },
+    { name = "leather", cmd = "leather ingest -kind olwb -source olwb",
+      into = "" },
+    { name = "clipboard", cmd = clip, into = "" },
+    { name = "file",
+      cmd = "cat >> " .. olwb_dest.shell_quote(olwb_store.dir .. "/outbox.md"),
+      into = "" },
+  }
+end
+
 function init()
   math.randomseed(now_ms())
 
@@ -1146,6 +1968,29 @@ function init()
   olwb_store.setup(opt("datadir"))
   state = olwb_store.load_state()
 
+  -- Benefits/issues state: backfill missing keys so callers can rely on
+  -- shape; seed the destination presets only when the key is absent.
+  if type(state.dest_sessions) ~= "table" then state.dest_sessions = {} end
+  if type(state.unread) ~= "table" then state.unread = {} end
+  if type(state.issue_repos) ~= "table" then state.issue_repos = {} end
+  if state.issues_model_cmd == nil or state.issues_model_cmd == "" then
+    state.issues_model_cmd = "claude -p"
+  end
+  if state.destinations == nil then
+    state.destinations = seed_destinations()
+    olwb_store.save_state(state)
+  end
+
+  -- Sweep job/payload files orphaned by a crash or kill (jobs never survive
+  -- a micro restart).
+  pcall(function()
+    for _, pat in ipairs({ "/job-*", "/tmp-send-*", "/issues/tmp-*-prompt.md" }) do
+      for _, p in ipairs(olwb_store.glob(olwb_store.dir .. pat)) do
+        goos.Remove(p)
+      end
+    end
+  end)
+
   config.AddRuntimeFileFromMemory(config.RTSyntax, "olwb.yaml", OLWB_SYNTAX)
   config.AddRuntimeFileFromMemory(config.RTSyntax, "olwbui.yaml", OLWB_UI_SYNTAX)
   config.AddRuntimeFileFromMemory(config.RTColorscheme, "olwb", OLWB_COLORSCHEME)
@@ -1158,6 +2003,7 @@ function init()
   -- Overridable keybinds (best-effort; failures are non-fatal).
   pcall(function() config.TryBindKey("Alt-o", "lua:olwb.key_open", false) end)
   pcall(function() config.TryBindKey("Alt-m", "lua:olwb.key_compose", false) end)
+  pcall(function() config.TryBindKey("Alt-i", "lua:olwb.key_inbox", false) end)
 
   if opt("theme") == true then
     pcall(function() config.SetGlobalOption("colorscheme", "olwb") end)

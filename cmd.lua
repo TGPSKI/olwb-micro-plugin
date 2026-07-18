@@ -13,6 +13,7 @@ M.verbs = {
   "liner", "session",
   "label", "labels",
   "filter", "search", "export",
+  "send", "dest", "issues",
   "list", "set", "help",
 }
 
@@ -22,8 +23,13 @@ M.subverbs = {
   session = { "start", "end", "name", "label" },
   filter = { "label:", "since:", "until:", "term:", "clear" },
   export = { "md", "json" },
-  set = { "autostart", "composesize", "datadir", "rulewidth", "theme", "timefmt" },
+  dest = { "add", "rm", "into", "kind", "session" },
+  issues = { "draft", "file", "list", "repo", "model" },
+  set = { "autostart", "composesize", "datadir", "rulewidth", "termcmd",
+          "theme", "timefmt" },
 }
+
+M.dest_kinds = { "claude", "codex", "opencode" }
 
 -- One row per command for the /? help menu: { usage, description }.
 M.help_entries = {
@@ -39,6 +45,9 @@ M.help_entries = {
   { "/filter clear",          "remove the active filter" },
   { "/search <term>",         "substring search over the feed" },
   { "/export [md|json] [path]", "write the feed to a file" },
+  { "/send <dest> [tui]",     "send selection (or scope) to a destination" },
+  { "/dest add|rm|into|kind|session", "manage send destinations" },
+  { "/issues draft|file|list|repo|model", "notes → agent-work GitHub issues" },
   { "/list",                  "list liners with message counts" },
   { "/set [option] [value]",  "view / change olwb options" },
   { "/help",                  "this menu (also /?)" },
@@ -95,32 +104,62 @@ local function common_prefix(list)
   return p
 end
 
--- Candidates for the token currently being typed. extra.liners supplies liner
--- names for /open. Returns candidates[], the partial token, and the line
--- prefix to keep in front of a completed token.
+-- Candidates for the token currently being typed. extra supplies dynamic
+-- pools: extra.liners (names for /open), extra.dests (destination names for
+-- /send and /dest …), extra.repos (issue-repo aliases for /issues draft).
+-- Returns candidates[], the partial token, and the line prefix to keep in
+-- front of a completed token.
 function M.candidates(line, extra)
   if not M.is_command(line) then return {}, "", "" end
+  extra = extra or {}
   local body = line:gsub("^%s*/", "")
   local trailing = body:match("%s$") ~= nil
   local toks = split_ws(body)
-  local part, pool, kept
-  if #toks == 0 or (#toks == 1 and not trailing) then
-    part = toks[1] or ""
+  -- 1-based index of the token being completed.
+  local n = #toks + (trailing and 1 or 0)
+  if n == 0 then n = 1 end
+  local part = trailing and "" or (toks[n] or "")
+  local pool, kept
+  if n == 1 then
     pool = M.verbs
     kept = "/"
-  elseif #toks == 1 or (#toks == 2 and not trailing) then
-    local verb = toks[1]
-    part = trailing and "" or (toks[2] or "")
-    if M.subverbs[verb] then
-      pool = M.subverbs[verb]
-    elseif verb == "open" and extra and extra.liners then
-      pool = extra.liners
-    else
-      return {}, "", ""
-    end
-    kept = "/" .. verb .. " "
   else
-    return {}, "", ""
+    local verb, sub = toks[1], toks[2]
+    if n == 2 then
+      if M.subverbs[verb] then
+        pool = M.subverbs[verb]
+      elseif verb == "open" then
+        pool = extra.liners
+      elseif verb == "send" then
+        pool = extra.dests
+      end
+    elseif n == 3 then
+      if verb == "dest" and (sub == "rm" or sub == "into" or sub == "kind") then
+        pool = extra.dests
+      elseif verb == "dest" and sub == "session" then
+        pool = { "list", "clear" }
+      elseif verb == "send" then
+        pool = { "tui" }
+      elseif verb == "issues" and sub == "draft" then
+        pool = extra.repos
+      elseif verb == "issues" and sub == "repo" then
+        pool = { "add", "rm", "list" }
+      elseif verb == "issues" and sub == "file" then
+        pool = { "latest" }
+      end
+    elseif n == 4 then
+      if verb == "dest" and sub == "kind" then
+        pool = M.dest_kinds
+      elseif verb == "dest" and sub == "into" then
+        pool = extra.liners
+      elseif verb == "dest" and sub == "session" and toks[3] == "clear" then
+        pool = extra.dests
+      elseif verb == "issues" and sub == "repo" and toks[3] == "rm" then
+        pool = extra.repos
+      end
+    end
+    if not pool then return {}, "", "" end
+    kept = "/" .. table.concat(toks, " ", 1, n - 1) .. " "
   end
   local out = {}
   for _, v in ipairs(pool) do
@@ -334,6 +373,178 @@ H["export"] = function(ctx, args, rest)
   if path == "" then path = nil end
   local ok, msg = ctx.export(fmt, path)
   if ok then ctx.info(msg) else ctx.error(msg) end
+end
+
+-- Find a destination by name in a state.destinations-shaped array.
+local function find_dest(list, name)
+  for i, d in ipairs(list or {}) do
+    if d.name == name then return d, i end
+  end
+  return nil
+end
+
+H["send"] = function(ctx, args, rest)
+  local name = args[1]
+  local mode = args[2]
+  if not name or (mode and mode ~= "tui") or args[3] then
+    ctx.error("usage: /send <dest> [tui]")
+    return
+  end
+  ctx.send_to(name, mode)
+end
+
+local DEST_USAGE = "usage: /dest add <name> <cmd…> | rm <name> | "
+  .. "into <name> <liner|-> | kind <name> <claude|codex|opencode|-> | "
+  .. "session list|clear <name>"
+
+H["dest"] = function(ctx, args, rest)
+  ctx.state.destinations = ctx.state.destinations or {}
+  local dests = ctx.state.destinations
+  local sub = args[1]
+  if not sub then
+    ctx.show_dests()
+    return
+  end
+  local name = args[2]
+  if sub == "add" then
+    -- rest = "add <name> <cmd…>": strip the two leading tokens.
+    local cmdstr = ctx.model.trim(strip_first_token(strip_first_token(rest)))
+    if not name or cmdstr == "" then
+      ctx.error("usage: /dest add <name> <shell command…>")
+      return
+    end
+    local d = find_dest(dests, name)
+    local verb = "updated"
+    if not d then
+      d = { name = name, into = "" }
+      dests[#dests + 1] = d
+      verb = "added"
+    end
+    d.cmd = cmdstr
+    d.kind = ctx.dest.infer_kind(cmdstr)
+    ctx.save_state()
+    ctx.info(verb .. " destination " .. name
+      .. (d.kind and (" (kind " .. d.kind .. ")") or ""))
+    ctx.rerender()
+  elseif sub == "rm" then
+    local _, i = find_dest(dests, name)
+    if not i then ctx.error("no destination '" .. tostring(name) .. "'") return end
+    table.remove(dests, i)
+    ctx.save_state()
+    ctx.info("removed destination " .. name)
+    ctx.rerender()
+  elseif sub == "into" then
+    local d = find_dest(dests, name)
+    if not d then ctx.error("no destination '" .. tostring(name) .. "'") return end
+    local liner = args[3]
+    if not liner then ctx.error("usage: /dest into <name> <liner|->") return end
+    d.into = liner == "-" and "" or liner
+    ctx.save_state()
+    ctx.info(name .. (d.into == "" and " responses discarded"
+      or (" responses → " .. d.into)))
+    ctx.rerender()
+  elseif sub == "kind" then
+    local d = find_dest(dests, name)
+    if not d then ctx.error("no destination '" .. tostring(name) .. "'") return end
+    local k = args[3]
+    local valid = k == "-"
+    for _, known in ipairs(M.dest_kinds) do
+      if k == known then valid = true end
+    end
+    if not valid then
+      ctx.error("usage: /dest kind <name> <claude|codex|opencode|->")
+      return
+    end
+    d.kind = k ~= "-" and k or nil
+    ctx.save_state()
+    ctx.info(name .. " kind = " .. (d.kind or "plain pipe"))
+    ctx.rerender()
+  elseif sub == "session" then
+    if name == "list" then
+      ctx.show_sessions()
+    elseif name == "clear" then
+      local dname = args[3]
+      if not dname then ctx.error("usage: /dest session clear <name>") return end
+      local liner = ctx.require_active_liner(); if not liner then return end
+      local key = dname .. "|" .. liner.id
+      ctx.state.dest_sessions = ctx.state.dest_sessions or {}
+      if ctx.state.dest_sessions[key] then
+        ctx.state.dest_sessions[key] = nil
+        ctx.save_state()
+        ctx.info("cleared " .. dname .. " session for this liner")
+      else
+        ctx.info("no stored " .. dname .. " session for this liner")
+      end
+    else
+      ctx.error("usage: /dest session list | clear <name>")
+    end
+  else
+    ctx.error(DEST_USAGE)
+  end
+end
+
+H["issues"] = function(ctx, args, rest)
+  local sub = args[1]
+  if sub == "draft" then
+    ctx.issues_draft(args[2])
+  elseif sub == "file" then
+    if not args[2] then ctx.error("usage: /issues file <id|latest>") return end
+    ctx.issues_file(args[2])
+  elseif sub == "list" then
+    ctx.show_issues_list()
+  elseif sub == "repo" then
+    ctx.state.issue_repos = ctx.state.issue_repos or {}
+    local repos = ctx.state.issue_repos
+    local op = args[2]
+    if op == "add" then
+      local alias, repo, path = args[3], args[4], args[5]
+      if not alias or not repo or not repo:match("^[%w%.%-_]+/[%w%.%-_]+$") then
+        ctx.error("usage: /issues repo add <alias> <owner/repo> [path]")
+        return
+      end
+      for i = #repos, 1, -1 do
+        if repos[i].alias == alias then table.remove(repos, i) end
+      end
+      repos[#repos + 1] = { alias = alias, repo = repo, path = path }
+      ctx.save_state()
+      ctx.info("repo " .. alias .. " → " .. repo .. (path and (" (" .. path .. ")") or ""))
+    elseif op == "rm" then
+      local alias = args[3]
+      local removed = false
+      for i = #repos, 1, -1 do
+        if repos[i].alias == alias then table.remove(repos, i); removed = true end
+      end
+      if removed then
+        ctx.save_state()
+        ctx.info("removed repo " .. alias)
+      else
+        ctx.error("no repo alias '" .. tostring(alias) .. "'")
+      end
+    elseif op == "list" then
+      if #repos == 0 then
+        ctx.info("no repos — /issues repo add <alias> <owner/repo> [path]")
+        return
+      end
+      local parts = {}
+      for _, r in ipairs(repos) do
+        parts[#parts + 1] = r.alias .. "→" .. r.repo
+      end
+      ctx.info(table.concat(parts, "  "))
+    else
+      ctx.error("usage: /issues repo add <alias> <owner/repo> [path] | rm <alias> | list")
+    end
+  elseif sub == "model" then
+    local cmdstr = ctx.model.trim(strip_first_token(rest))
+    if cmdstr == "" then
+      ctx.info("issues model: " .. (ctx.state.issues_model_cmd or "claude -p"))
+      return
+    end
+    ctx.state.issues_model_cmd = cmdstr
+    ctx.save_state()
+    ctx.info("issues model = " .. cmdstr)
+  else
+    ctx.error("usage: /issues draft [<repo>] | file <id|latest> | list | repo … | model [<cmd…>]")
+  end
 end
 
 H["list"] = function(ctx)

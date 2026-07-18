@@ -42,11 +42,13 @@ function M.setup(datadir)
   M.dir = datadir
   goos.MkdirAll(M.liners_dir(), DIR_PERM)
   goos.MkdirAll(M.backups_dir(), DIR_PERM)
+  goos.MkdirAll(M.issues_dir(), DIR_PERM)
   return M.dir
 end
 
 function M.liners_dir()  return filepath.Join(M.dir, "liners") end
 function M.backups_dir() return filepath.Join(M.dir, "backups") end
+function M.issues_dir()  return filepath.Join(M.dir, "issues") end
 function M.state_path()  return filepath.Join(M.dir, "state.json") end
 function M.liner_path(id) return filepath.Join(M.liners_dir(), id .. ".json") end
 
@@ -143,13 +145,21 @@ end
 -- Directory scan (best-effort; core paths use the state registry instead)
 -------------------------------------------------------------------------------
 
--- Returns an array of liner ids discovered on disk. Used only to rebuild a lost
--- registry; gopher-luar exposes the Glob result as a callable iterator.
+-- Glob as a plain Lua array (gopher-luar exposes the Go slice as a callable
+-- iterator; this flattens it for pure-Lua callers).
+function M.glob(pattern)
+  local out = {}
+  local matches, err = filepath.Glob(pattern)
+  if err ~= nil or matches == nil then return out end
+  for _, path in matches() do out[#out + 1] = path end
+  return out
+end
+
+-- Returns an array of liner ids discovered on disk. Used only to rebuild a
+-- lost registry.
 function M.list_liner_ids()
   local ids = {}
-  local matches, err = filepath.Glob(filepath.Join(M.liners_dir(), "*.json"))
-  if err ~= nil or matches == nil then return ids end
-  for _, path in matches() do
+  for _, path in ipairs(M.glob(filepath.Join(M.liners_dir(), "*.json"))) do
     local base = filepath.Base(path)
     local id = base:gsub("%.json$", "")
     ids[#ids + 1] = id

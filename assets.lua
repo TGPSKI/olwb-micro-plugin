@@ -18,6 +18,7 @@ rules:
     - special: "\\[direct\\]"
     - special: "^\\s+/[a-z?]+"
     - olwb.selection: "^\\s*▶ .*$"
+    - olwb.selection: "^\\s*▌.*$"
 ]]
 
 -- Chrome panes (title line, Liner/Session bar): the title renders in the same
@@ -51,6 +52,50 @@ color-link statusline "#d4d4d4,#252526"
 color-link tabbar "#d4d4d4,#252526"
 ]]
 
+-- The /issues draft model prompt. Seeded once to <datadir>/issues-prompt.md;
+-- at run time that file wins over this embedded copy, so users tune the
+-- prompt without touching the plugin. The prompt is followed by three
+-- delimited sections built in issues.lua: ## Target repository,
+-- ## Repository context, ## Notes to process.
+OLWB_ISSUES_PROMPT = [[
+You transform terse parking-lot notes into agent-consumable GitHub issues
+following the agent-work template. The sections below give you the target
+repository, optional repository context, and the notes to process.
+
+Clustering rules:
+
+- One issue per coherent unit of work.
+- Merge duplicate notes into one issue.
+- Split compound notes ("X, also Y") into separate issues.
+- A note too vague to act on becomes a checkbox inside a single
+  "triage: clarify parked notes" issue rather than being silently dropped.
+- Every input note must be traceable to exactly one output issue.
+
+Title convention: `area: imperative summary` (e.g. "config: auto-discover
+./config.yaml", "doctor: fix incorrect source attribution"). At most 90
+characters, no newlines.
+
+Body contract (the agent-work template), two sections:
+
+`## Context` — bullets. The FIRST bullet cites the context an implementing
+subagent should load: when the Repository context section includes a routing
+table whose domain matches the work, cite that specific
+`.subagents/AGENTS-*.md`; otherwise cite `AGENTS.md`. Then provenance
+bullets: each source note VERBATIM with its timestamp and labels, e.g.
+`Session note (2026-07-17 13:37): "label inheritance is broken"` — plus any
+inferred cost/severity framing.
+
+`## Work` — 2 to 5 bounded, independently verifiable `- [ ]` checkboxes.
+Where a note reports a suspicion rather than a verified fact, the first
+checkbox confirms the problem before later checkboxes fix it.
+
+Output contract: respond with ONLY a JSON array, no prose:
+
+[{"title": "...", "body": "...", "labels": ["agent-work", "..."]}]
+
+The `agent-work` label must be present on every issue.
+]]
+
 -- In-editor help. Shown by /help and reachable via >help olwb.
 OLWB_HELP = [[
 # olwb — one-line-with-benefits
@@ -73,11 +118,15 @@ Domain model: Liner -> Session -> Message. Labels are inherited
     Up / Down              also cycle the options while typing a /command
     Space                  during /open cycling: expand the selection's
                            details (id, description, labels, counts)
-    Shift-Tab              (empty/plain line) jump into the feed to browse:
-                           arrows scroll, Shift-Tab or typing returns and
-                           snaps the scroll back to the top
+    Shift-Tab              (empty/plain line) browse the feed message by
+                           message: ↑/↓ jump between messages, Space toggles
+                           the selection, `a` selects all (or clears a full
+                           selection), Enter opens the send picker, and
+                           Shift-Tab or typing returns to the one line
     Alt-o                  open / focus olwb
     Alt-m                  jump to the one line
+    Alt-i                  toggle between the active liner and the inbox
+                           (where destination responses land)
 
 Typing in any other olwb pane bounces focus (and the keystroke) back into
 the one line, so a stray mouse click never strands the keyboard.
@@ -113,7 +162,48 @@ as you type; the input grows automatically when a long line wraps.
     /list                          list liners with message counts
     /help  (or /?)                 toggle the command menu
 
+    /send <dest> [tui]             send the selection (or the whole current
+                                   scope) to a destination; `tui` opens the
+                                   CLI interactively in a new terminal
+    /dest                          list destinations (overlay)
+    /dest add <name> <cmd…>        add a destination (stdin pipe; kind is
+                                   inferred from claude/codex/opencode)
+    /dest rm <name>                remove a destination
+    /dest into <name> <liner|->    where responses land (- = nowhere)
+    /dest kind <name> <kind|->     override the CLI adapter kind
+    /dest session list             stored dest|liner → session mappings
+    /dest session clear <name>     forget this liner's session for a dest
+
+    /issues draft [<repo>]         selection → agent-work issue drafts via a
+                                   model; writes a reviewable gh script
+    /issues file <id|latest>       run a reviewed script (files the issues)
+    /issues list                   drafts with status (overlay)
+    /issues repo add <alias> <owner/repo> [path]
+    /issues repo rm <alias> | list manage target repositories
+    /issues model [<cmd…>]         show / set the drafting model command
+
 Dates are YYYY-MM-DD (optionally with HH:MM[:SS]).
+
+## Sending, sessions, and the inbox
+
+Destinations are user-editable shell commands fed the selection as markdown
+(with timestamps and labels) on stdin. Presets are seeded on first run:
+claude / codex / opencode (responses into the inbox liner), leather,
+clipboard, and file. Destinations with a CLI kind keep a session per
+liner — a second /send continues the same conversation; a stale session is
+retried fresh exactly once. `/send <dest> tui` opens the CLI in a new
+terminal window (auto-detected; override with /set termcmd) resuming the
+same session. Responses land as messages labeled #<dest>; the bar shows
+`<liner>: N new` until you visit (Alt-i).
+
+## The pipeline — notes to agent-work issues
+
+/issues draft sends the selection to a model that must answer with strict
+JSON (title/body/labels per issue, agent-work label enforced); olwb
+validates it and deterministically renders a gh script — nothing is filed
+until you read the script and run /issues file. Sources get labeled #filed,
+and the drafts/results live in the `issues` liner. The prompt template is
+seeded to <datadir>/issues-prompt.md and yours to edit.
 
 ## Native commands
 
@@ -131,11 +221,17 @@ Dates are YYYY-MM-DD (optionally with HH:MM[:SS]).
     olwb.composesize   minimum one-line height in rows (default 1; grows as
                        needed up to 8)
     olwb.rulewidth     feed separator width (default 48)
+    olwb.termcmd       terminal command for /send <dest> tui (auto-detected;
+                       stored in state.json, not micro settings)
     olwb.theme         apply the bundled olwb colorscheme (default off)
 
 ## Storage
 
     <datadir>/liners/<id>.json     one file per liner (atomic writes)
-    <datadir>/state.json           active liner/session, labels, filter, registry
+    <datadir>/state.json           active liner/session, labels, filter,
+                                   registry, destinations, sessions, unread
     <datadir>/backups/             timestamped copies before destructive ops
+    <datadir>/issues/              issue drafts: <id>.sh script + <id>.json
+                                   manifest (+ .raw.txt on rejected drafts)
+    <datadir>/issues-prompt.md     the drafting prompt (seeded, user-editable)
 ]]

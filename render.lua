@@ -59,10 +59,16 @@ end
 --   rule_width  : int (default 48)
 --   filter      : filter table or nil
 --   include_direct : bool
+--   selected    : set of message ids to mark with a ▌ prefix
+-- Second return: an index array, one row per rendered entry —
+-- { start = <0-based first buffer line>, stop = <last line>, id, entry } —
+-- the coordinate system message-granular browsing navigates by. Line numbers
+-- are unaffected by olwb.lua's pad_lines (it only prefixes columns).
 function M.render_feed(liner, state, opts)
   opts = opts or {}
   assert(opts.fmt_time, "render_feed requires opts.fmt_time")
   local out = {}
+  local index = {}
 
   local entries = olwb_model.flatten_desc(liner, {
     include_direct = opts.include_direct,
@@ -73,13 +79,31 @@ function M.render_feed(liner, state, opts)
     out[#out + 1] = "(no messages yet — type above and press Enter)"
   else
     for _, entry in ipairs(entries) do
+      local start = #out
+      local sel = opts.selected and entry.message.id
+        and opts.selected[entry.message.id]
       for _, l in ipairs(M.entry_lines(entry, opts)) do
-        out[#out + 1] = l
+        out[#out + 1] = sel and ("▌ " .. l) or l
       end
+      index[#index + 1] = {
+        start = start, stop = #out - 1,
+        id = entry.message.id, entry = entry,
+      }
     end
   end
 
-  return table.concat(out, "\n")
+  return table.concat(out, "\n"), index
+end
+
+-- One entry as markdown: content bullet + italic timestamp / labels line.
+-- Shared by render_export_md (whole scope) and render_selection_md (explicit
+-- entry list, e.g. the /send payload).
+local function entry_md_lines(entry, opts, out)
+  local ls = labels_str(entry.labels)
+  out[#out + 1] = "- " .. (entry.message.content or "")
+  local meta = "  _" .. opts.fmt_time(entry.message.timestamp) .. "_"
+  if ls ~= "" then meta = meta .. " " .. ls end
+  out[#out + 1] = meta
 end
 
 -- Plain-text export (same as feed but without the live header chrome; used by
@@ -102,11 +126,26 @@ function M.render_export_md(liner, opts)
     filter = opts.filter,
   })
   for _, entry in ipairs(entries) do
-    local ls = labels_str(entry.labels)
-    out[#out + 1] = "- " .. (entry.message.content or "")
-    local meta = "  _" .. opts.fmt_time(entry.message.timestamp) .. "_"
-    if ls ~= "" then meta = meta .. " " .. ls end
-    out[#out + 1] = meta
+    entry_md_lines(entry, opts, out)
+  end
+  out[#out + 1] = ""
+  return table.concat(out, "\n")
+end
+
+-- Markdown for an explicit entry list (feed order) — the payload builder for
+-- /send and /issues draft. Shares the per-entry shape with render_export_md;
+-- metadata (timestamps, labels, liner title) rides along so downstream
+-- processors see provenance, not just bare lines.
+function M.render_selection_md(liner, entries, opts)
+  opts = opts or {}
+  assert(opts.fmt_time, "render_selection_md requires opts.fmt_time")
+  local out = {}
+  local name = (liner and liner.metadata and liner.metadata.name) or ""
+  if name == "" then name = "olwb" end
+  out[#out + 1] = "# " .. name
+  out[#out + 1] = ""
+  for _, entry in ipairs(entries or {}) do
+    entry_md_lines(entry, opts, out)
   end
   out[#out + 1] = ""
   return table.concat(out, "\n")

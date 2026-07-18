@@ -173,6 +173,17 @@ mock["time"] = {
   end,
 }
 
+-- micro/shell: jobs are no-ops (the executor paths are exercised in the tmux
+-- end-to-end run); ExecCommand pretends nothing is installed so the
+-- destination seeding takes its fallback branches.
+local job_log = {}
+mock["micro/shell"] = {
+  JobStart = function(cmd) job_log[#job_log + 1] = cmd; return {} end,
+  JobSpawn = function() return {} end,
+  ExecCommand = function() return "", "not found" end,
+  RunCommand = function() return "", "not found" end,
+}
+
 -- The mocked global import().
 local function mock_import(pkg)
   local m = mock[pkg]
@@ -187,7 +198,8 @@ end
 local ENV = setmetatable({}, { __index = _G })
 ENV.import = mock_import
 
-local files = { "json", "assets", "model", "render", "cmd", "store", "migrate", "olwb" }
+local files = { "json", "assets", "model", "render", "cmd", "dest", "issues",
+  "store", "migrate", "olwb" }
 for _, name in ipairs(files) do
   local path = root .. name .. ".lua"
   local fh = assert(io.open(path, "r"))

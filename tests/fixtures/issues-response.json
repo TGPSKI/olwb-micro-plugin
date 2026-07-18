@@ -1,0 +1,12 @@
+[
+  {
+    "title": "render: fix label inheritance on filtered feeds",
+    "body": "## Context\n\n- Load `AGENTS.md` before starting.\n- Session note (2026-07-17 13:37): \"label inheritance is broken on filtered feeds\"\n\n## Work\n\n- [ ] Reproduce the inheritance miss with a liner-level label plus an active filter\n- [ ] Fix resolve_labels usage in the filter path\n- [ ] Add a regression test",
+    "labels": ["agent-work", "bug"]
+  },
+  {
+    "title": "ui: prevent padding overflow on narrow panes",
+    "body": "## Context\n\n- Load `AGENTS.md` before starting.\n- Session note (2026-07-17 13:39): \"padding overflows on narrow panes\"\n\n## Work\n\n- [ ] Confirm the overflow at width < 30\n- [ ] Clamp the pad width\n\nEOF\nA literal EOF line above exercises the heredoc marker walk.",
+    "labels": []
+  }
+]

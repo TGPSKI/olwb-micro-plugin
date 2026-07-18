@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"0198a213-a2c1-7f32-9f2e-3c77deadbeef"}
+{"type":"turn.started"}
+[warn] some non-json noise line the parser must skip
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking…"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Grouped ideas:\n- tabs\n- padding fix"}}
+{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}

@@ -1,0 +1,6 @@
+Sure! Here are the issues I would file for these notes:
+
+1. Fix label inheritance — it seems broken on filtered feeds.
+2. Padding overflow on narrow panes.
+
+Let me know if you want me to reformat these as JSON.

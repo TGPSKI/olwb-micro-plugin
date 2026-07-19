@@ -140,6 +140,9 @@ to the command's stdin. First run seeds a few presets: `claude`, `codex`,
 `opencode` (responses land in the `inbox` liner), `leather`, `clipboard`, and
 `file`. Edit or remove them; they are not re-seeded.
 
+Longer walkthroughs live in [docs/send.md](docs/send.md) and
+[docs/dest.md](docs/dest.md).
+
 ```
 /dest add oc-review "opencode run --agent review"    an agent-flavored preset
 /dest into oc-review reviews                          responses → `reviews` liner
@@ -207,7 +210,7 @@ adopters) so issues cite the right context; the prompt template itself is
 seeded to
 `<datadir>/issues-prompt.md` and yours to tune. Sequencing filed issues into
 a DAG and dispatching subagents is out of olwb's scope; it stops at filing
-well-formed issues.
+well-formed issues. The full guide is [docs/issues.md](docs/issues.md).
 
 ### Native-only commands
 

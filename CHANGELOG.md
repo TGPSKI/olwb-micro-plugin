@@ -65,6 +65,9 @@ All notable changes to olwb are documented here. Format loosely follows
 - README: new "Browse mode", "The benefits — sending", and "The pipeline —
   notes to agent-work issues" sections; updated data-directory and module
   tables.
+- New user guides: `docs/dest.md` (destinations, adapters, sessions),
+  `docs/send.md` (browse mode, sending, tui, inbox), and `docs/issues.md`
+  (the notes → issues pipeline).
 - AGENTS.md: documents the `dest.lua`/`issues.lua` modules, the
   `JobStart`-callback crash and the file-redirected job architecture that
   works around it, and the completed status of the benefits and issues

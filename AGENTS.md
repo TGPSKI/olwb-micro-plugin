@@ -91,6 +91,11 @@ tmux send-keys -t t C-e; tmux send-keys -t t "olwb" Enter
 tmux capture-pane -t t -p          # add -e to inspect colors
 ```
 
+(`micro -config-dir <dir>` fully isolates settings/plugins too, without
+touching `$HOME` — use it over the settings.json caveat above when you need
+a pristine config *and* still want `claude`/`codex`/`opencode` credentials,
+which live under the real `$HOME`.)
+
 Design plans live in `.agents/plans/` and are tracked in git, in dependency
 order: `olwb-micro-plan.md` (the core plugin), `olwb-benefits-plan.md`
 (per-message navigation, multi-select, send-to-destination, sessions, inbox),

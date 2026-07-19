@@ -3,3 +3,7 @@ log.txt
 # editor/OS cruft
 *.swp
 .DS_Store
+
+# demo tooling stays local (not part of the published plugin)
+recordings/
+scripts/demo/

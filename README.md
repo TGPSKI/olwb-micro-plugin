@@ -1,16 +1,19 @@
 # olwb — one line with benefits, for [micro](https://micro-editor.github.io/)
 
-A one-line-input notepad living inside the micro editor. You type one line,
-press Enter, and it drops into the feed directly beneath the input with a
-timestamp and any active labels — new lines enter at the top of the stack and
-push the older ones down. That's the whole ritual.
+A cognitive thread parking lot for a wild graph mind. Capture now, process
+later.
 
-> **Origins** — olwb is inspired by (and is a full reimplementation of) the
-> original *one-line-with-benefits* Electron app from 2024: same domain model
-> (**Liner → Session → Message**), same append-only feed, timestamps, label
-> inheritance, and slash-command language — with the Electron runtime replaced
-> by a ~zero-dependency Lua plugin that lives where the writing already
-> happens.
+olwb is a one-line-input notepad living inside the micro editor: you type one
+line, press Enter, and it drops into the feed directly beneath the input with
+a timestamp and any active labels. New lines enter at the top of the stack
+and push the older ones down. Next, enjoy the benefits: send olwb content to
+models and other destinations, with replies landing in olwb inboxes or
+spawned interactive terminals.
+
+> olwb is a reimplementation of the *one-line-with-benefits* Electron app I
+> wrote in 2024. The domain model (Liner → Session → Message), append-only
+> feed, label inheritance, and slash-command language carry over; the Electron
+> runtime does not.
 
 ## The interface
 
@@ -32,13 +35,12 @@ push the older ones down. That's the whole ritual.
     Session: 6H2X8NEH
 ```
 
-Typing `/` swaps the feed for a live command menu (filtered as you type;
-Tab/Shift-Tab/↑/↓ cycle through verbs, subcommands, and liner names with the
-selection highlighted — Enter runs the filled-in line, Space expands a liner's
-details during `/open`). `/?` toggles the menu. The one line grows
-automatically when its text wraps, typing from any pane bounces focus back to
-the input, and nothing is loaded on open — the line comes pre-filled with
-`/open <your most recent liner>`, ready for Enter.
+Typing `/` swaps the feed for a live command menu, filtered as you type.
+Tab/Shift-Tab/↑/↓ cycle through verbs, subcommands, and liner names; Enter
+runs the filled-in line; Space expands a liner's details during `/open`; `/?`
+toggles the menu. The one line grows when its text wraps, and typing from any
+pane bounces focus back to the input. Nothing is loaded on open — the line
+comes pre-filled with `/open <your most recent liner>`, ready for Enter.
 
 ## Install
 
@@ -58,8 +60,8 @@ Restart micro (or `> reload`). Then:
 > olwb                 open the olwb layout
 ```
 
-Type a line, press **Enter**. That's it — a `notes` liner and a session are
-created automatically on the first message.
+Type a line and press Enter. A `notes` liner and a session are created
+automatically on the first message.
 
 ## Usage
 
@@ -131,12 +133,12 @@ handy for keybindings and macros.
 
 ### The benefits — sending
 
-Destinations are **user-editable shell command templates**: the selection (or,
+A destination is a user-editable shell command template. The selection (or,
 with nothing selected, the whole current scope, respecting the active filter)
 is rendered as markdown — liner title, content, timestamps, labels — and piped
-to the command's stdin. Presets are seeded on first run: `claude`, `codex`,
+to the command's stdin. First run seeds a few presets: `claude`, `codex`,
 `opencode` (responses land in the `inbox` liner), `leather`, `clipboard`, and
-`file` — edit or remove them freely, they never re-seed.
+`file`. Edit or remove them; they are not re-seeded.
 
 ```
 /dest add oc-review "opencode run --agent review"    an agent-flavored preset
@@ -145,29 +147,29 @@ to the command's stdin. Presets are seeded on first run: `claude`, `codex`,
 ```
 
 Destinations whose command starts with `claude` / `codex` / `opencode` get an
-**adapter kind** (inferred, overridable with `/dest kind`): the send runs with
-the CLI's JSON output flag, the response text (never raw JSON) lands as a
-message labeled `#<dest>` in the destination's `into` liner, and the CLI's
-**session id is stored per destination × liner** — the next `/send` resumes
-the same conversation. A stale session retries fresh exactly once;
-`/dest session list|clear` manages the stored ids. olwb defines no agents of
-its own: an "agent preset" is just a destination whose command names an agent
-from the CLI's own registry (`--agent`, `--profile`, …).
+adapter kind (inferred, overridable with `/dest kind`). The send runs with
+the CLI's JSON output flag, and the response text lands as a message labeled
+`#<dest>` in the destination's `into` liner. The CLI's session id is stored
+per destination and liner, so the next `/send` resumes the same conversation;
+a stale session retries fresh exactly once, and `/dest session list|clear`
+manages the stored ids. olwb defines no agents of its own — an "agent preset"
+is just a destination whose command names an agent from the CLI's own
+registry (`--agent`, `--profile`, …).
 
-`/send <dest> tui` opens the CLI **interactively in a new terminal window**
-instead — resuming the stored session when one exists, otherwise starting
+`/send <dest> tui` opens the CLI interactively in a new terminal window
+instead, resuming the stored session when one exists, otherwise starting
 fresh with a pointer to the payload file. The terminal is auto-detected
 (`$TERMINAL`, then konsole/foot/alacritty/kitty/xterm); override with
 `/set termcmd "<cmd>"`.
 
 Responses landing in a non-active liner bump a bar badge (`inbox: 2 new`);
 `Alt-i` toggles to the inbox and back. While a send is in flight the bar shows
-`<dest> working…` — micro never blocks.
+`<dest> working…`; sends don't block the editor.
 
 ### The pipeline — notes to agent-work issues
 
-`/issues` turns parked notes into GitHub issues an agent can implement,
-with a **mandatory human review gate** in the middle:
+`/issues` turns parked notes into GitHub issues an agent can implement.
+Nothing is filed until you've read the generated script:
 
 ```
 /issues repo add olwb TGPSKI/olwb-micro-plugin ~/git/TGPSKI/olwb-micro-plugin
@@ -178,12 +180,12 @@ with a **mandatory human review gate** in the middle:
 ```
 
 Stage 1 sends the selection to a model (`/issues model`, default `claude -p`)
-that must answer with **strict JSON** — title, body, labels per issue,
+that must answer with strict JSON: title, body, and labels per issue,
 following the agent-work template (`## Context` bullets citing the context an
 implementing subagent should load plus verbatim note provenance, `## Work` as
-bounded checkboxes, label `agent-work` enforced). The model never produces
-shell: olwb validates the JSON and **deterministically renders** the `gh`
-filing script from it, e.g.:
+bounded checkboxes, label `agent-work` enforced). The model produces no
+shell — olwb validates the JSON and renders the `gh` filing script from it
+deterministically, e.g.:
 
 ```bash
 echo '[1/2] render: fix label inheritance on filtered feeds'
@@ -195,16 +197,17 @@ EOF
 )"
 ```
 
-A malformed response is rejected whole (raw output saved for inspection) — it
-can at worst produce a bad issue body, never a bad command. After filing, the
+A malformed response is rejected whole, with the raw output saved for
+inspection; at worst the model produces a bad issue body, not a bad command.
+After filing, the
 sources are labeled `#filed`, URLs land in the `issues` liner, and refiling is
 refused. When a repo target has a local `path`, the draft prompt is enriched
 with its `AGENTS.md` (and `.subagents/` routing table for directed-contexts
 adopters) so issues cite the right context; the prompt template itself is
 seeded to
-`<datadir>/issues-prompt.md` and yours to tune. Downstream — sequencing filed
-issues into a DAG and dispatching subagents — is deliberately out of olwb's
-scope; the issues it files are well-formed inputs to that tooling.
+`<datadir>/issues-prompt.md` and yours to tune. Sequencing filed issues into
+a DAG and dispatching subagents is out of olwb's scope; it stops at filing
+well-formed issues.
 
 ### Native-only commands
 
@@ -222,7 +225,7 @@ work if you prefer them.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `olwb.datadir` | `""` | storage directory (empty ⇒ `$XDG_DATA_HOME/olwb`) |
+| `olwb.datadir` | `""` | storage directory (empty = `$XDG_DATA_HOME/olwb`) |
 | `olwb.autostart` | `false` | open olwb on launch when micro is started with no file |
 | `olwb.timefmt` | `%Y-%m-%d %H:%M:%S` | `strftime` format for timestamps |
 | `olwb.composesize` | `1` | minimum one-line height, in rows (auto-grows to 8) |
@@ -231,14 +234,14 @@ work if you prefer them.
 | `olwb.theme` | `false` | apply the bundled `olwb` colorscheme |
 
 The feed uses the `olwb` filetype, so its rule lines, timestamps and `#labels`
-pick up colours from **your** colorscheme by default. An optional `olwb`
+pick up colours from your own colorscheme by default. An optional `olwb`
 colorscheme (dark, `#1e1e1e`/`#a370f7`/`#3da9fc`/`#7ef4b9`) ships with the
 plugin — opt in with `olwb.theme=true` or `> set colorscheme olwb`.
 
 ## Data model & storage
 
-Labels are **inherited** and resolved at render time as
-`liner ∪ session ∪ message` — storage stays minimal at each level. The feed
+Labels are inherited and resolved at render time: a message shows its own
+labels plus its session's and its liner's, so storage stays minimal. The feed
 renders strictly newest-first across every session in scope (newest at the
 top, next to the input); storage order within a session stays append-order.
 
@@ -296,8 +299,8 @@ expose `encoding/json` to plugins.
 | `store.lua` | file-per-liner persistence, atomic write, state, backups | os, ioutil, filepath, util |
 | `olwb.lua` | plugin entry: panes, callbacks, commands, keybinds, send/issues executors | micro, config, buffer, util, shell, os, time |
 
-The six pure modules have zero editor dependencies, so they run — and are
-tested — under a plain `lua` interpreter outside micro.
+The six pure modules have no editor dependencies, so they run and are tested
+under a plain `lua` interpreter outside micro.
 
 ## Testing
 

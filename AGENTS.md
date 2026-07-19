@@ -68,7 +68,7 @@ olwb-micro-plugin/
   unavailable to callbacks, hence the `|| echo olwb-job-failed >> <errfile>`
   marker. Re-run the tmux e2e several times after touching an executor.
   The loading spinner rides the same trampoline: while any `job_begin` topic
-  is pending, a `sleep 0.5` ticker job loops, its onExit opening an
+  is pending, a `sleep 0.25` ticker job loops, its onExit opening an
   `olwb://tick` buffer whose `onBufferOpen` branch advances the frame and
   rerenders on the main state. Register background work via
   `job_begin(topic, note)`/`job_end(topic)`, never by touching

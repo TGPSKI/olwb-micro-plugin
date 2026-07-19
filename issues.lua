@@ -249,7 +249,8 @@ function M.render_draft_md(id, repo, drafts, script_path)
       lines[#lines + 1] = "   - [ ] " .. first_box
     end
   end
-  lines[#lines + 1] = "review the script, then: /issues file " .. id
+  lines[#lines + 1] = "review: /issues open " .. id
+    .. " — then file: /issues file " .. id
   return table.concat(lines, "\n")
 end
 

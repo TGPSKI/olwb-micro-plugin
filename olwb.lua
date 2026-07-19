@@ -70,7 +70,8 @@ local open_olwb, do_migrate, rescan, selftest
 local compose_input, menu_text, bar_text, liner_names, layout_panes
 local sync_compose_size, show_options, set_option
 local cmd_extra, send_to, send_tui, deliver_response, selection_entries
-local issues_draft, issues_file, list_issue_manifests, reset_feed_scroll
+local issues_draft, issues_file, issues_open, list_issue_manifests
+local reset_feed_scroll
 local cycle_step, show_overlay, start_job, drain_jobs
 
 -------------------------------------------------------------------------------
@@ -326,7 +327,7 @@ end
 local function start_ticker()
   if ticker_live then return end
   ticker_live = true
-  shell.JobStart("sleep 0.5", noop, noop, function()
+  shell.JobStart("sleep 0.25", noop, noop, function()
     buffer.NewBuffer("", TICK_PATH) -- fires onBufferOpen on the main state
   end)
 end
@@ -815,30 +816,69 @@ function issues_draft(alias)
       deliver_response("issues", summary, "draft")
       selected = {}
       rerender()
-      info("drafted " .. #drafts .. " issue(s) → review " .. draft_id
-        .. ".sh, then /issues file " .. draft_id)
+      info("drafted " .. #drafts .. " issue(s) — /issues open " .. draft_id
+        .. " to review, then /issues file " .. draft_id)
     end)
   rerender()
   info("drafting issues via " .. mcmd .. "…")
 end
 
+-- Resolve a draft id (nil/"latest" -> newest) to its manifest table.
+local function find_manifest(id)
+  if id == nil or id == "" or id == "latest" then
+    local m = list_issue_manifests()[1]
+    if not m then return nil, "no drafts yet — /issues draft" end
+    return m
+  end
+  local s = olwb_store.read_file(manifest_path(id))
+  if s then
+    local ok, m = pcall(olwb_json.decode, s)
+    if ok and type(m) == "table" then return m end
+  end
+  return nil, "no draft '" .. tostring(id) .. "' (/issues list)"
+end
+
+-- The review step as a command: open the draft's gh script in a new tab
+-- (the olwb layout stays untouched), editable, ready for /issues file.
+function issues_open(id)
+  local manifest, merr = find_manifest(id)
+  if not manifest then err(merr) return end
+  if not manifest.script or not olwb_store.exists(manifest.script) then
+    err("draft " .. manifest.id .. " has no script on disk (/issues list)")
+    return
+  end
+  local buf
+  local okb = pcall(function()
+    buf = buffer.NewBufferFromFile(manifest.script)
+  end)
+  if not okb or not buf then
+    err("could not open " .. manifest.script)
+    return
+  end
+  local opened = false
+  pcall(function()
+    micro.CurPane():AddTab()
+    micro.CurPane():OpenBuffer(buf)
+    opened = true
+  end)
+  if not opened then -- no tab support in this pane: fall back to a split
+    pcall(function()
+      micro.CurPane():HSplitBuf(buf)
+      opened = true
+    end)
+  end
+  if not opened then
+    err("could not open a pane for " .. manifest.script)
+    return
+  end
+  info("reviewing draft " .. manifest.id .. " — edit/save as needed, then /issues file "
+    .. manifest.id)
+end
+
 -- Stage 2: run the reviewed gh script. Never called automatically.
 function issues_file(id)
-  local manifest
-  if id == "latest" then
-    manifest = list_issue_manifests()[1]
-    if not manifest then err("no drafts yet — /issues draft") return end
-  else
-    local s = olwb_store.read_file(manifest_path(id))
-    if s then
-      local ok, m = pcall(olwb_json.decode, s)
-      if ok and type(m) == "table" then manifest = m end
-    end
-    if not manifest then
-      err("no draft '" .. tostring(id) .. "' (/issues list)")
-      return
-    end
-  end
+  local manifest, merr = find_manifest(id)
+  if not manifest then err(merr) return end
   if manifest.status ~= "drafted" then
     err("draft " .. manifest.id .. " already filed"
       .. (manifest.filed_ms and (" " .. fmt_time(manifest.filed_ms)) or ""))
@@ -1244,7 +1284,8 @@ end
 -- the in-flight job (if any) on top and each draft's last failure beneath it.
 local function issues_list_text()
   local lines = {
-    "issue drafts — review the script, then /issues file <id|latest>", "",
+    "issue drafts — /issues open <id|latest> reviews the script,"
+      .. " /issues file runs it", "",
   }
   local pl = progress_line("issues")
   if pl then
@@ -1377,6 +1418,7 @@ function build_ctx()
     show_issues_list = function() show_overlay("issues") end,
     issues_draft = function(alias) issues_draft(alias) end,
     issues_file = function(id) issues_file(id) end,
+    issues_open = function(id) issues_open(id) end,
   }
 end
 

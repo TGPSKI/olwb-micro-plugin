@@ -579,6 +579,7 @@ do
     ctx.show_issues_list = record("show_issues_list")
     ctx.issues_draft = record("issues_draft")
     ctx.issues_file = record("issues_file")
+    ctx.issues_open = record("issues_open")
     return ctx
   end
 
@@ -642,6 +643,11 @@ do
   eq(ctx.calls[2] and ctx.calls[2][2], "latest", "/issues file latest routes")
   cmd.dispatch(ctx, "/issues list")
   eq(ctx.calls[3] and ctx.calls[3][1], "show_issues_list", "/issues list overlay")
+  cmd.dispatch(ctx, "/issues open")
+  ok(ctx.calls[4] and ctx.calls[4][1] == "issues_open" and ctx.calls[4][2] == nil,
+    "/issues open with no id routes (defaults to latest)")
+  cmd.dispatch(ctx, "/issues open 20260718-1")
+  eq(ctx.calls[5] and ctx.calls[5][2], "20260718-1", "/issues open routes the id")
 
   ctx = make_ctx()
   cmd.dispatch(ctx, "/issues repo add olwb TGPSKI/olwb-micro-plugin /home/x")

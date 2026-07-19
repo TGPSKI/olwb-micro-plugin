@@ -24,7 +24,7 @@ M.subverbs = {
   filter = { "label:", "since:", "until:", "term:", "clear" },
   export = { "md", "json" },
   dest = { "add", "rm", "into", "kind", "session" },
-  issues = { "draft", "file", "list", "repo", "model" },
+  issues = { "draft", "open", "file", "list", "repo", "model" },
   set = { "autostart", "composesize", "datadir", "rulewidth", "termcmd",
           "theme", "timefmt" },
 }
@@ -47,7 +47,7 @@ M.help_entries = {
   { "/export [md|json] [path]", "write the feed to a file" },
   { "/send <dest> [tui]",     "send selection (or scope) to a destination" },
   { "/dest add|rm|into|kind|session", "manage send destinations" },
-  { "/issues draft|file|list|repo|model", "notes → agent-work GitHub issues" },
+  { "/issues draft|open|file|list|repo|model", "notes → agent-work GitHub issues" },
   { "/list",                  "list liners with message counts" },
   { "/set [option] [value]",  "view / change olwb options" },
   { "/help",                  "this menu (also /?)" },
@@ -144,7 +144,7 @@ function M.candidates(line, extra)
         pool = extra.repos
       elseif verb == "issues" and sub == "repo" then
         pool = { "add", "rm", "list" }
-      elseif verb == "issues" and sub == "file" then
+      elseif verb == "issues" and (sub == "file" or sub == "open") then
         pool = { "latest" }
       end
     elseif n == 4 then
@@ -487,6 +487,8 @@ H["issues"] = function(ctx, args, rest)
   local sub = args[1]
   if sub == "draft" then
     ctx.issues_draft(args[2])
+  elseif sub == "open" then
+    ctx.issues_open(args[2])
   elseif sub == "file" then
     if not args[2] then ctx.error("usage: /issues file <id|latest>") return end
     ctx.issues_file(args[2])
@@ -543,7 +545,7 @@ H["issues"] = function(ctx, args, rest)
     ctx.save_state()
     ctx.info("issues model = " .. cmdstr)
   else
-    ctx.error("usage: /issues draft [<repo>] | file <id|latest> | list | repo … | model [<cmd…>]")
+    ctx.error("usage: /issues draft [<repo>] | open [<id|latest>] | file <id|latest> | list | repo … | model [<cmd…>]")
   end
 end
 

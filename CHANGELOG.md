@@ -21,6 +21,9 @@ All notable changes to olwb are documented here. Format loosely follows
   bottom bar (and the `/issues list` overlay) with what is running and
   elapsed time, e.g. `⠹ filing 7 issue(s) on o/r  12s`, driven by a
   main-state-safe sleep ticker.
+- **`/issues open [<id|latest>]`**: opens a draft's filing script in a new
+  tab for the review step — editable, saveable, no more retyping the path
+  from the `/issues list` overlay.
 - **Label preflight**: generated filing scripts create any missing labels
   (create-if-absent, never `--force`) before the first `gh issue create`,
   so a label the drafting model invented no longer aborts the whole run.

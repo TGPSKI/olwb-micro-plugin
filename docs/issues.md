@@ -59,7 +59,13 @@ and the last error recorded against a draft.
 
 ## The review step
 
-Open `<id>.sh` and read it. This is the whole point of the two-stage design:
+```
+/issues open latest        open the newest draft's script in a new tab
+/issues open <id>          or a specific one
+```
+
+Read the script (`/issues open` opens it as a normal editable buffer —
+close the tab to return to olwb). This is the whole point of the two-stage design:
 the script is plain `gh issue create` calls, one per issue, and you are the
 gate between drafting and filing. Edit it if an issue needs adjusting, or
 delete it and re-draft.

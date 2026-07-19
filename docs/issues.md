@@ -51,13 +51,21 @@ The draft lands on disk under the data directory:
 <datadir>/issues/<id>.sh          the filing script — read this
 <datadir>/issues/<id>.json        manifest (sources, repo, status)
 <datadir>/issues/<id>.raw.txt     only on a rejected response
+<datadir>/issues/<id>.err.log     only on a failed job — full stderr
 ```
 
-`/issues list` shows all drafts with their status.
+`/issues list` shows all drafts with their status, the running job (if any),
+and the last error recorded against a draft.
 
 ## The review step
 
-Open `<id>.sh` and read it. This is the whole point of the two-stage design:
+```
+/issues open latest        open the newest draft's script in a new tab
+/issues open <id>          or a specific one
+```
+
+Read the script (`/issues open` opens it as a normal editable buffer —
+close the tab to return to olwb). This is the whole point of the two-stage design:
 the script is plain `gh issue create` calls, one per issue, and you are the
 gate between drafting and filing. Edit it if an issue needs adjusting, or
 delete it and re-draft.
@@ -69,9 +77,30 @@ delete it and re-draft.
 /issues file <id>          or a specific one
 ```
 
-Filing records the issue URLs as messages in the `issues` liner, labels the
-source messages `#filed`, and marks the draft done — refiling the same
-draft is refused.
+The script first ensures every label it uses exists on the repo
+(create-if-absent; existing labels are never modified), then files the
+issues. Filing records the issue URLs as messages in the `issues` liner,
+labels the source messages `#filed`, and marks the draft done — refiling
+the same draft is refused.
+
+## Errors, status, and progress
+
+While a draft or filing job runs, the bottom bar (and the `/issues list`
+overlay) shows a spinner with what is running and for how long, e.g.
+`⠹ filing 7 issue(s) on o/r  12s`.
+
+When a job fails, the short version flashes in micro's info bar, and the
+full story lands as an `⚠ error`-labeled message in the `issues` liner:
+complete stderr, the script and manifest paths, any issue URLs that were
+filed before the failure (a re-run would double-file those — the script
+runs under `set -e`, so partial filing is possible), and the exact command
+to retry. The raw stderr is also kept at `<datadir>/issues/<id>.err.log`,
+and the failure is recorded on the manifest (`last_error`), where
+`/issues list` shows it until a later run succeeds. The draft's status
+stays `drafted` after a failure; nothing is ever retried automatically.
+
+Send failures (`/send`) surface the same way, into the destination's
+`into` liner — or an `olwb-errors` liner when the destination has none.
 
 ## Tuning the prompt
 

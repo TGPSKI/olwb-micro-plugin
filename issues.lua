@@ -185,6 +185,26 @@ function M.render_script(repo, drafts, opts)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "REPO=" .. shq(repo)
 
+  -- Preflight: every referenced label must exist or `gh issue create` aborts
+  -- (and with set -e, the whole run). Create-if-absent per label; `|| true`
+  -- swallows the already-exists failure without touching an existing label's
+  -- color or description (which --force would overwrite).
+  local seen, labels = {}, {}
+  for _, d in ipairs(drafts) do
+    for _, l in ipairs(d.labels) do
+      if not seen[l] then
+        seen[l] = true
+        labels[#labels + 1] = shq(l)
+      end
+    end
+  end
+  if #labels > 0 then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "for L in " .. table.concat(labels, " ") .. "; do"
+    lines[#lines + 1] = "  gh label create \"$L\" --repo \"$REPO\" >/dev/null 2>&1 || true"
+    lines[#lines + 1] = "done"
+  end
+
   for i, d in ipairs(drafts) do
     -- Collision-free heredoc marker, per issue: EOF unless the body contains
     -- a literal EOF line, then OLWB_EOF_1, OLWB_EOF_2, … until free.
@@ -229,7 +249,8 @@ function M.render_draft_md(id, repo, drafts, script_path)
       lines[#lines + 1] = "   - [ ] " .. first_box
     end
   end
-  lines[#lines + 1] = "review the script, then: /issues file " .. id
+  lines[#lines + 1] = "review: /issues open " .. id
+    .. " — then file: /issues file " .. id
   return table.concat(lines, "\n")
 end
 

@@ -176,6 +176,7 @@ as you type; the input grows automatically when a long line wraps.
 
     /issues draft [<repo>]         selection → agent-work issue drafts via a
                                    model; writes a reviewable gh script
+    /issues open [<id|latest>]     open a draft's script in a new tab to review
     /issues file <id|latest>       run a reviewed script (files the issues)
     /issues list                   drafts with status (overlay)
     /issues repo add <alias> <owner/repo> [path]

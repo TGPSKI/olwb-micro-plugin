@@ -67,6 +67,20 @@ olwb-micro-plugin/
   JobStart callback — route new jobs through `start_job`. Exit codes are
   unavailable to callbacks, hence the `|| echo olwb-job-failed >> <errfile>`
   marker. Re-run the tmux e2e several times after touching an executor.
+  The loading spinner rides the same trampoline: while any `job_begin` topic
+  is pending, a `sleep 0.5` ticker job loops, its onExit opening an
+  `olwb://tick` buffer whose `onBufferOpen` branch advances the frame and
+  rerenders on the main state. Register background work via
+  `job_begin(topic, note)`/`job_end(topic)`, never by touching
+  `pending_jobs` directly, or the spinner and bar note go stale.
+- Workflow errors go through `report_error(into_name, headline, detail)`:
+  info-bar flash plus a persistent `error`-labeled feed message (in the
+  destination's `into` liner, the `issues` liner, or the fallback
+  `olwb-errors` liner). Full stderr evidence is kept on disk for the issues
+  pipeline (`<datadir>/issues/<id>.err.log`) and the failure is recorded on
+  the manifest (`last_error`/`last_error_ms`, cleared on a later success).
+  Don't add new user-facing failure paths that only call `err()` — the bar
+  truncates and evaporates.
 - User text must never be interpolated into a `JobStart` command string —
   payloads travel via stdin tmp files; only olwb-generated values (datadir
   paths, validated session ids) may appear on a command line, shell-quoted.

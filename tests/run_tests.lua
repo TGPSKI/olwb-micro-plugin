@@ -378,6 +378,18 @@ do
     "literal EOF body gets a collision-free marker")
   ok(script:find("%[1/2%]") ~= nil and script:find("%[2/2%]") ~= nil,
     "progress echoes numbered")
+  -- Label preflight: create-if-absent for the union of labels, before the
+  -- first create, without --force (which would clobber existing labels).
+  ok(script:find("for L in 'agent-work' 'bug'; do", 1, true) ~= nil,
+    "preflight loops over the deduped label union")
+  ok(script:find('gh label create "$L" --repo "$REPO" >/dev/null 2>&1 || true',
+    1, true) ~= nil, "preflight creates labels, swallowing already-exists")
+  ok(script:find("--force", 1, true) == nil,
+    "preflight never uses --force")
+  local pre_at = script:find("gh label create", 1, true)
+  local create_at = script:find("gh issue create", 1, true)
+  ok(pre_at ~= nil and create_at ~= nil and pre_at < create_at,
+    "preflight precedes the first gh issue create")
 
   -- build_prompt: sections present, payload passed through.
   local p = issues.build_prompt({

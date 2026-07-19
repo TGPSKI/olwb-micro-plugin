@@ -3,6 +3,28 @@
 All notable changes to olwb are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Errors in the feed**: workflow failures (`/send`, `/issues draft`,
+  `/issues file`) now land as persistent `⚠ error`-labeled messages — in the
+  destination's `into` liner, the `issues` liner, or a fallback `olwb-errors`
+  liner — carrying full stderr, kept evidence paths, any partially-filed
+  issue URLs, and the retry command. The info bar still flashes the short
+  version.
+- **Failure evidence kept**: failed issues jobs save full stderr to
+  `<datadir>/issues/<id>.err.log` and record `last_error`/`last_error_ms` on
+  the manifest (cleared on a later success); `/issues list` shows the last
+  error under each draft.
+- **Progress indicator**: background jobs show an animated spinner in the
+  bottom bar (and the `/issues list` overlay) with what is running and
+  elapsed time, e.g. `⠹ filing 7 issue(s) on o/r  12s`, driven by a
+  main-state-safe sleep ticker.
+- **Label preflight**: generated filing scripts create any missing labels
+  (create-if-absent, never `--force`) before the first `gh issue create`,
+  so a label the drafting model invented no longer aborts the whole run.
+
 ## [1.1.0] - 2026-07-18
 
 ### Added

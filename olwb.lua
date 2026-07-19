@@ -56,7 +56,8 @@ local selected = {}        -- set of message ids; persists until sent/cleared
 local feed_index           -- render_feed's entry index (nil while an overlay shows)
 
 -- Send machinery.
-local pending_jobs = {}    -- dest name -> in-flight job count (bar indicator)
+local pending_jobs = {}    -- topic (dest name | "issues") -> in-flight count
+local job_notes = {}       -- topic -> { text, started_ms } for the indicator
 local prev_liner_key       -- liner to return to on the second Alt-i
 local job_queue = {}       -- finished jobs awaiting main-state processing
 
@@ -304,11 +305,70 @@ function drain_jobs()
   end
 end
 
--- The job-completion trampoline target (see start_job). Must be module-scope
--- so micro finds it; ignores every buffer except the throwaway ones.
+-- Background-job progress: every job registers under a topic via job_begin,
+-- which notes what is running; the bar and the /issues overlay render a
+-- spinner + note + elapsed seconds via progress_line. Terminals only repaint
+-- on events, so while anything is pending a `sleep` job loops as a ticker,
+-- each lap hopping to the main Lua state through the same buffer trampoline
+-- real jobs use (see start_job) before advancing the frame.
+local SPIN = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local TICK_PATH = "olwb://tick"
+local spin_frame = 1
+local ticker_live = false
+
+local function jobs_pending()
+  for _, n in pairs(pending_jobs) do
+    if n > 0 then return true end
+  end
+  return false
+end
+
+local function start_ticker()
+  if ticker_live then return end
+  ticker_live = true
+  shell.JobStart("sleep 0.5", noop, noop, function()
+    buffer.NewBuffer("", TICK_PATH) -- fires onBufferOpen on the main state
+  end)
+end
+
+local function job_begin(topic, note)
+  pending_jobs[topic] = (pending_jobs[topic] or 0) + 1
+  job_notes[topic] = { text = note, started_ms = now_ms() }
+  start_ticker()
+end
+
+local function job_end(topic)
+  pending_jobs[topic] = math.max(0, (pending_jobs[topic] or 1) - 1)
+  if pending_jobs[topic] == 0 then job_notes[topic] = nil end
+end
+
+-- "⠹ filing 7 issue(s) on o/r  12s" for a topic with work in flight, or nil.
+local function progress_line(topic)
+  local n = pending_jobs[topic]
+  if not n or n == 0 then return nil end
+  local note = job_notes[topic]
+  local txt = (note and note.text) or (topic .. " working…")
+  local secs = note and math.floor((now_ms() - note.started_ms) / 1000)
+  return SPIN[spin_frame] .. " " .. txt .. (secs and ("  " .. secs .. "s") or "")
+end
+
+-- The job-completion and ticker trampoline target (see start_job). Must be
+-- module-scope so micro finds it; ignores every buffer except the throwaway
+-- ones.
 function onBufferOpen(buf)
   local ok, path = pcall(function() return buf.Path end)
-  if not ok or path ~= JOB_DONE_PATH then return end
+  if not ok then return end
+  if path == TICK_PATH then
+    pcall(function() buf:Close() end)
+    ticker_live = false
+    if jobs_pending() then
+      spin_frame = spin_frame % #SPIN + 1
+      start_ticker()
+    end
+    rerender() -- advance the spinner, or clear it after the last job
+    return
+  end
+  if path ~= JOB_DONE_PATH then return end
   pcall(function() buf:Close() end)
   drain_jobs()
 end
@@ -326,6 +386,19 @@ local function stderr_tail(text)
   local out = table.concat(lines, " | ", from)
   if out == "" then out = "(no stderr)" end
   if #out > 160 then out = out:sub(1, 157) .. "…" end
+  return out
+end
+
+-- The whole stderr (marker stripped, clipped) for feed error messages, where
+-- there is room to act on it — stderr_tail is only the info-bar teaser.
+local function stderr_detail(text)
+  local lines = {}
+  for line in ((text or "") .. "\n"):gmatch("(.-)\n") do
+    if not line:find(FAIL_MARKER, 1, true) then lines[#lines + 1] = line end
+  end
+  local out = table.concat(lines, "\n"):gsub("%s+$", "")
+  if out == "" then out = "(no stderr)" end
+  if #out > 4000 then out = out:sub(1, 4000) .. "\n…(clipped)" end
   return out
 end
 
@@ -393,6 +466,18 @@ function deliver_response(into_name, content, label)
   olwb_store.save_state(state)
   rerender() -- feed (if target is active) and the bar badge/count
   return target.id
+end
+
+-- Workflow errors the user must act on land twice: the info bar flash for
+-- immediacy, and — with the detail the bar can't fit — as an 'error'-labeled
+-- feed message in `into_name` (default: an "olwb-errors" liner), persistent,
+-- full-width, and badged like any other delivered response.
+local function report_error(into_name, headline, detail)
+  err(headline)
+  if not into_name or into_name == "" then into_name = "olwb-errors" end
+  local body = "⚠ " .. headline
+  if detail and detail ~= "" then body = body .. "\n\n" .. detail end
+  deliver_response(into_name, body, "error")
 end
 
 -- Auto-detect a terminal for TUI sends: $TERMINAL first, then common
@@ -491,10 +576,11 @@ function send_to(name, mode, is_retry)
     return
   end
 
-  pending_jobs[d.name] = (pending_jobs[d.name] or 0) + 1
+  job_begin(d.name, "sending " .. n .. " note" .. (n == 1 and "" or "s")
+    .. " → " .. d.name)
   start_job(cmdstr, tmp,
     function(stdout, stderr_text)
-      pending_jobs[d.name] = math.max(0, (pending_jobs[d.name] or 1) - 1)
+      job_end(d.name)
       local failed = job_failed(stderr_text)
       local response_text
       if d.kind then
@@ -507,13 +593,18 @@ function send_to(name, mode, is_retry)
           return
         end
         if failed then
-          err(d.name .. " failed: " .. stderr_tail(stderr_text))
+          report_error(d.into, d.name .. " failed: " .. stderr_tail(stderr_text),
+            "sending " .. n .. " note(s) from " .. source_name
+            .. " via " .. d.name .. " (" .. d.kind .. ")\n\nstderr:\n"
+            .. stderr_detail(stderr_text))
           rerender()
           return
         end
         local parsed, perr = olwb_dest.parse(d.kind, stdout)
         if not parsed then
-          err(d.name .. ": " .. tostring(perr))
+          report_error(d.into, d.name .. ": " .. tostring(perr),
+            "the " .. d.kind .. " response could not be parsed.\n\nstdout (head):\n"
+            .. tostring(stdout or ""):sub(1, 2000))
           rerender()
           return
         end
@@ -525,7 +616,9 @@ function send_to(name, mode, is_retry)
         response_text = parsed.text
       else
         if failed then
-          err(d.name .. " failed: " .. stderr_tail(stderr_text))
+          report_error(d.into, d.name .. " failed: " .. stderr_tail(stderr_text),
+            "sending " .. n .. " note(s) from " .. source_name
+            .. " via " .. d.name .. "\n\nstderr:\n" .. stderr_detail(stderr_text))
           rerender()
           return
         end
@@ -540,7 +633,7 @@ function send_to(name, mode, is_retry)
       rerender()
       info("sent " .. n .. " message(s) to " .. d.name)
     end)
-  rerender() -- bar shows "<dest> working…"
+  rerender() -- bar shows the spinner + "sending n → dest"
   info("sending " .. n .. " message(s) to " .. d.name .. "…")
 end
 
@@ -672,12 +765,19 @@ function issues_draft(alias)
   end
   local mcmd = state.issues_model_cmd or "claude -p"
 
-  pending_jobs["issues"] = (pending_jobs["issues"] or 0) + 1
+  job_begin("issues", "drafting issues from " .. #entries .. " note(s) via "
+    .. mcmd)
   start_job(mcmd, tmp,
     function(stdout, stderr_text)
-      pending_jobs["issues"] = math.max(0, (pending_jobs["issues"] or 1) - 1)
+      job_end("issues")
       if job_failed(stderr_text) then
-        err("issues draft failed: " .. stderr_tail(stderr_text))
+        local logp = olwb_store.issues_dir() .. "/" .. draft_id .. ".err.log"
+        olwb_store.write_file_atomic(logp, stderr_text or "")
+        report_error("issues",
+          "issues draft failed: " .. stderr_tail(stderr_text),
+          "draft " .. draft_id .. " — model command: " .. mcmd
+          .. "\nfull stderr kept: " .. logp
+          .. "\n\nstderr:\n" .. stderr_detail(stderr_text))
         rerender()
         return
       end
@@ -685,8 +785,13 @@ function issues_draft(alias)
       if not drafts then
         local rawpath = olwb_store.issues_dir() .. "/" .. draft_id .. ".raw.txt"
         olwb_store.write_file_atomic(rawpath, stdout or "")
-        err("draft rejected: " .. table.concat(perrs or {}, "; ")
-          .. " — raw response: " .. rawpath)
+        report_error("issues",
+          "draft rejected: " .. table.concat(perrs or {}, "; "),
+          "draft " .. draft_id .. " — the model response failed validation:\n- "
+          .. table.concat(perrs or {}, "\n- ")
+          .. "\n\nraw response kept: " .. rawpath
+          .. "\nadjust the notes or " .. olwb_store.dir
+          .. "/issues-prompt.md, then re-run /issues draft")
         rerender()
         return
       end
@@ -739,10 +844,11 @@ function issues_file(id)
       .. (manifest.filed_ms and (" " .. fmt_time(manifest.filed_ms)) or ""))
     return
   end
-  pending_jobs["issues"] = (pending_jobs["issues"] or 0) + 1
+  job_begin("issues", "filing " .. (manifest.count or "?") .. " issue(s) on "
+    .. manifest.repo)
   start_job("sh " .. olwb_dest.shell_quote(manifest.script), nil,
     function(stdout, stderr_text)
-      pending_jobs["issues"] = math.max(0, (pending_jobs["issues"] or 1) - 1)
+      job_end("issues")
       local urls = {}
       for line in ((stdout or "") .. "\n"):gmatch("(.-)\n") do
         local url = line:match("^%s*(https?://%S+)%s*$")
@@ -753,13 +859,29 @@ function issues_file(id)
         -- so a manual re-run can be reasoned about. Status stays drafted;
         -- never auto-retry (that could double-file).
         if #urls > 0 then manifest.filed_urls = urls end
+        local logp = olwb_store.issues_dir() .. "/" .. manifest.id .. ".err.log"
+        olwb_store.write_file_atomic(logp, stderr_text or "")
+        manifest.last_error = stderr_tail(stderr_text)
+        manifest.last_error_ms = now_ms()
         save_manifest(manifest)
-        err("filing failed (" .. #urls .. " issue(s) got through, status stays drafted): "
-          .. stderr_tail(stderr_text))
+        report_error("issues",
+          "filing failed (" .. #urls .. " issue(s) got through, status stays drafted): "
+            .. stderr_tail(stderr_text),
+          "draft " .. manifest.id .. " on " .. manifest.repo
+          .. "\nscript: " .. manifest.script
+          .. "\nfull stderr kept: " .. logp
+          .. (#urls > 0
+              and ("\nfiled before the failure (a re-run would double-file these):\n"
+                   .. table.concat(urls, "\n"))
+              or "")
+          .. "\n\nstderr:\n" .. stderr_detail(stderr_text)
+          .. "\n\nfix the cause, then: /issues file " .. manifest.id)
         rerender()
         return
       end
       manifest.status = "filed"
+      manifest.last_error = nil
+      manifest.last_error_ms = nil
       manifest.filed_ms = now_ms()
       manifest.filed_urls = urls
       save_manifest(manifest)
@@ -1023,8 +1145,9 @@ function bar_text()
   local selcount = 0
   for _ in pairs(selected) do selcount = selcount + 1 end
   if selcount > 0 then extras[#extras + 1] = selcount .. " selected" end
-  for name, n in pairs(pending_jobs) do
-    if n > 0 then extras[#extras + 1] = name .. " working…" end
+  for name in pairs(pending_jobs) do
+    local pl = progress_line(name)
+    if pl then extras[#extras + 1] = pl end
   end
   if state and state.unread then
     for lid, n in pairs(state.unread) do
@@ -1117,19 +1240,38 @@ local function sessions_text()
   return table.concat(lines, "\n")
 end
 
--- The /issues list overlay: drafts from the manifest dir, newest first.
+-- The /issues list overlay: drafts from the manifest dir, newest first, with
+-- the in-flight job (if any) on top and each draft's last failure beneath it.
 local function issues_list_text()
   local lines = {
     "issue drafts — review the script, then /issues file <id|latest>", "",
   }
+  local pl = progress_line("issues")
+  if pl then
+    lines[#lines + 1] = "  " .. pl
+    lines[#lines + 1] = ""
+  end
   local ms = list_issue_manifests()
-  if #ms == 0 then
+  if #ms == 0 and not pl then
     lines[#lines + 1] = "  (none — select messages, then /issues draft [<repo>])"
   end
   for _, m in ipairs(ms) do
+    local status = tostring(m.status)
+    if m.status == "filed" and m.filed_urls then
+      status = "filed:" .. #m.filed_urls
+    end
     lines[#lines + 1] = string.format("  %-16s %-24s %2d issue(s)  %-8s %s",
-      tostring(m.id), tostring(m.repo), m.count or 0,
-      tostring(m.status), tostring(m.script))
+      tostring(m.id), tostring(m.repo), m.count or 0, status,
+      tostring(m.script))
+    if m.status ~= "filed" and m.last_error then
+      lines[#lines + 1] = "      ⚠ " .. tostring(m.last_error)
+        .. (m.filed_urls
+            and (" — " .. #m.filed_urls .. " already filed; a re-run double-files those")
+            or "")
+      if m.last_error_ms then
+        lines[#lines] = lines[#lines] .. "  (" .. fmt_time(m.last_error_ms) .. ")"
+      end
+    end
   end
   return table.concat(lines, "\n")
 end

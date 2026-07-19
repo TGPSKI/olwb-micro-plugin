@@ -3,7 +3,7 @@
 All notable changes to olwb are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.1.0] - 2026-07-18
 
 ### Added
 
@@ -69,3 +69,10 @@ All notable changes to olwb are documented here. Format loosely follows
   `JobStart`-callback crash and the file-redirected job architecture that
   works around it, and the completed status of the benefits and issues
   plans.
+
+## [1.0.0] - 2026-07-17
+
+Initial release: the core plugin — one-line capture feed, Liner → Session →
+Message model with label inheritance, slash commands with the live menu and
+Tab completion, filtering/search/export, and file-per-liner JSON storage
+with atomic writes.

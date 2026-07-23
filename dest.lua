@@ -29,7 +29,7 @@ function M.shell_quote(s)
 end
 
 -- A session id is only ever interpolated after this gate: strictly
--- alphanumeric plus - and _ (ULIDs, UUIDs, and friends all pass).
+-- alphanumeric plus -, _ and . (ULIDs, UUIDs, and friends all pass).
 local function safe_id(id)
   return type(id) == "string" and id ~= "" and id:match("^[%w%-_%.]+$") ~= nil
 end

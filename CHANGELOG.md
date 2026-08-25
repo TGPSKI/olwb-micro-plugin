@@ -28,6 +28,12 @@ All notable changes to olwb are documented here. Format loosely follows
   (create-if-absent, never `--force`) before the first `gh issue create`,
   so a label the drafting model invented no longer aborts the whole run.
 
+### Docs
+
+- **`CONTRIBUTING.md`**: external contribution policy — trivial
+  comment/docstring-only PRs are not merged; deeper contributions (multiple
+  issues, code, behavior changes) are welcome.
+
 ## [1.1.0] - 2026-07-18
 
 ### Added

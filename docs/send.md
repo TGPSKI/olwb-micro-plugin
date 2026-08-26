@@ -23,8 +23,8 @@ The current message's first line is highlighted:
 | `Enter` | open the destination picker (`/send ` pre-filled, Tab-cycling) |
 | `Shift-Tab` | back to the one line (the selection survives) |
 
-The bar shows `N selected` while a selection exists; it clears after a
-successful send.
+The bar shows `N selected` while a selection exists. A successful send clears
+the selection it sent; selections made while that send was running remain.
 
 ## Firing a send
 

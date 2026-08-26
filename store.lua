@@ -11,6 +11,7 @@ local goos = import("os")            -- Go os (Stat/Rename/MkdirAll/Getenv)
 local ioutil = import("io/ioutil")
 local filepath = import("filepath")
 local util = import("micro/util")
+local gotime = import("time")
 -- NOTE: the standard Lua `os` global (os.date/os.time) is still reachable via
 -- micro's package.seeall; we deliberately do NOT shadow it with the Go import.
 
@@ -18,6 +19,15 @@ local M = {}
 
 local DIR_PERM = tonumber("755", 8)
 local FILE_PERM = tonumber("644", 8)
+local STATE_LOCK_WAIT = 2 * gotime.Second
+local STATE_LOCK_POLL = 10 * gotime.Millisecond
+local state_dest_sessions_base = {}
+
+local function copy_map(src)
+  local out = {}
+  for k, v in pairs(type(src) == "table" and src or {}) do out[k] = v end
+  return out
+end
 
 -------------------------------------------------------------------------------
 -- Directory resolution
@@ -50,6 +60,7 @@ function M.liners_dir()  return filepath.Join(M.dir, "liners") end
 function M.backups_dir() return filepath.Join(M.dir, "backups") end
 function M.issues_dir()  return filepath.Join(M.dir, "issues") end
 function M.state_path()  return filepath.Join(M.dir, "state.json") end
+function M.state_lock_path() return filepath.Join(M.dir, "state.json.lock") end
 function M.liner_path(id) return filepath.Join(M.liners_dir(), id .. ".json") end
 
 -------------------------------------------------------------------------------
@@ -125,7 +136,7 @@ function M.default_state()
   }
 end
 
-function M.load_state()
+local function load_state_file()
   local path = M.state_path()
   local str = M.read_file(path)
   if not str then return M.default_state() end
@@ -137,8 +148,67 @@ function M.load_state()
   return state
 end
 
+function M.load_state()
+  local state = load_state_file()
+  state_dest_sessions_base = copy_map(state.dest_sessions)
+  return state
+end
+
+-- state.json is shared by every micro instance using this datadir. Serialize
+-- saves with an O_EXCL lock file, then apply only this process's session-key
+-- changes to the latest disk map. The baseline distinguishes deletion from a
+-- stale snapshot that simply never saw another process's new key.
+local function acquire_state_lock()
+  local lock_path = M.state_lock_path()
+  local started = gotime.Now()
+  while gotime.Since(started) < STATE_LOCK_WAIT do
+    local f, err = goos.OpenFile(lock_path,
+      goos.O_CREATE + goos.O_EXCL + goos.O_WRONLY, FILE_PERM)
+    if err == nil and f ~= nil then
+      f:Close()
+      return true
+    end
+    local info = goos.Stat(lock_path)
+    local stale = false
+    if info ~= nil then
+      pcall(function()
+        stale = gotime.Since(info:ModTime()) >= STATE_LOCK_WAIT
+      end)
+    end
+    if stale then goos.Remove(lock_path) end
+    gotime.Sleep(STATE_LOCK_POLL)
+  end
+  return false, "timed out waiting for " .. lock_path
+end
+
 function M.save_state(state)
-  return M.write_file_atomic(M.state_path(), olwb_json.encode(state))
+  local locked, lerr = acquire_state_lock()
+  if not locked then return false, lerr end
+
+  local ok, saved, serr = pcall(function()
+    local current = copy_map(state.dest_sessions)
+    local changed = {}
+    for key, value in pairs(current) do
+      if state_dest_sessions_base[key] ~= value then changed[key] = value end
+    end
+    for key in pairs(state_dest_sessions_base) do
+      if current[key] == nil then changed[key] = false end
+    end
+
+    local disk = load_state_file()
+    local merged = copy_map(disk.dest_sessions)
+    for key, value in pairs(changed) do
+      merged[key] = value ~= false and value or nil
+    end
+    state.dest_sessions = merged
+
+    local wrote, werr = M.write_file_atomic(M.state_path(), olwb_json.encode(state))
+    if wrote then state_dest_sessions_base = copy_map(merged) end
+    return wrote, werr
+  end)
+  goos.Remove(M.state_lock_path())
+  if not ok then return false, saved end
+  return saved, serr
 end
 
 -------------------------------------------------------------------------------

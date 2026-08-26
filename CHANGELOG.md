@@ -28,6 +28,17 @@ All notable changes to olwb are documented here. Format loosely follows
   (create-if-absent, never `--force`) before the first `gh issue create`,
   so a label the drafting model invented no longer aborts the whole run.
 
+### Fixed
+
+- **Shared destination sessions**: `state.json` saves now lock and merge
+  per-key `dest_sessions` changes, preserving additions and deletions made by
+  other micro instances using the same data directory.
+- **Async sends**: stale-session retries reuse the original payload and
+  provenance; completion clears only the selection sent by that attempt, so
+  edits and selections made while it runs survive.
+- **Issue filing**: `/issues file` refuses a second invocation while an issues
+  job is running, preventing duplicate GitHub issues.
+
 ### Docs
 
 - **`CONTRIBUTING.md`**: external contribution policy — trivial

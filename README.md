@@ -98,34 +98,40 @@ the selection it sent; selections made while that send was running remain.
 ### Slash commands (typed in the one line)
 
 ```
-/new [name]                    create + activate a new liner
-/open <name|id>                load + activate an existing liner
-/close                         deactivate liner (ends its session)
-/save                          force a save (saves are automatic)
+/new [name]              /n    create + activate a new liner
+/open <name|id|query>    /o    search for or activate a liner
+/close                   /c    deactivate liner (ends its session)
+/save                    /v    force a save (saves are automatic)
 
-/liner start|end               start / end the active liner
+/liner start|end         /r    start / end the active liner
 /liner name <s> | desc <s>     set liner name / description
 /liner label <l>               toggle a liner-level label
 
-/session start|end             start / end a session
+/session start|end       /u    start / end a session
 /session name <s>              name the active session
 /session label <l>             toggle a session-level label
 
-/label <name>                  toggle a label applied to new messages
-/labels                        list known labels with counts
+/label <name>            /l    toggle a label applied to new messages
+/labels                  /k    list known labels with counts
 
-/filter label:<l> [since:<d>] [until:<d>] [term:<t>]
+/filter label:<l> [since:<d>] [until:<d>] [term:<t>]  (/f)
 /filter clear                  remove the active filter
-/search <term>                 substring search over the current scope
-/export [md|json] [path]       write the current scope to a file
-/list                          list liners with message counts
-/set [option] [value]          view / change olwb options (no micro >set needed)
-/help  (or /?)                 toggle the command menu
+/search <term>           /q    substring search over the current scope
+/export [md|json] [path] /e    write the current scope to a file
+/list                    /a    list liners with message counts
+/set [option] [value]    /t    view / change olwb options (no micro >set needed)
+/help  (or /?)           /h    toggle the command menu
 
-/send <dest> [tui]             send the selection (or whole scope) to a destination
-/dest [add|rm|into|kind|session …]   manage destinations
-/issues [draft|file|list|repo|model …]   notes → agent-work GitHub issues
+/send <dest> [tui]       /s    send the selection (or whole scope) to a destination
+/dest [add|rm|into|kind|session …]  (/d)   manage destinations
+/issues [draft|file|list|repo|model …]  (/i)   notes → agent-work GitHub issues
 ```
+
+With no active liner, submitting bare text turns it into a live `/open`
+search instead of creating a liner. In that search, repeated `label:` tokens
+are ANDed; remaining text matches liner names, ids, and descriptions. For
+example, `label:work label:active release` finds active work liners whose
+identity or description contains `release`. Tab cycles the matching liners.
 
 Dates are `YYYY-MM-DD` (optionally `HH:MM[:SS]`). Every slash command is also
 reachable natively as `> olwb <verb> [args]` (without the leading `/`), which is

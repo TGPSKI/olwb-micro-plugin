@@ -118,6 +118,21 @@ do
   eq(labels[2], "sess", "resolution order: session second")
   eq(labels[3], "msg", "resolution order: message third")
   eq(#labels, 3, "resolution dedups shared labels")
+
+  local searchable = model.new_liner("L-project", "Project Alpha",
+    "release planning", { "work", "active" })
+  ok(model.liner_matches_query(searchable, "Project Alpha",
+    { labels = { "work" }, term = "alpha" }),
+    "liner search matches one label plus free text")
+  ok(model.liner_matches_query(searchable, "Project Alpha",
+    { labels = { "work", "active" }, term = "planning" }),
+    "liner search ANDs two matching labels")
+  ok(not model.liner_matches_query(searchable, "Project Alpha",
+    { labels = { "work", "missing" }, term = "" }),
+    "liner search rejects an unknown label")
+  ok(not model.liner_matches_query(searchable, "Project Alpha",
+    { labels = { "work" }, term = "beta" }),
+    "liner search preserves free-text filtering")
 end
 
 -------------------------------------------------------------------------------
@@ -434,6 +449,11 @@ do
   ok(not cmd.is_command("hello"), "is_command false for plain text")
   eq(cmd.parse("   "), nil, "parse blank -> nil")
 
+  local query = cmd.parse_open_query("label:work label:#active Project Alpha")
+  eq(query.labels[1], "work", "open query parses one label token")
+  eq(query.labels[2], "active", "open query parses repeated label tokens")
+  eq(query.term, "Project Alpha", "open query preserves remaining free text")
+
   local ms = cmd.parse_date("2024-08-31")
   ok(ms ~= nil and ms > 0, "parse_date returns ms")
   eq(cmd.parse_date("not-a-date"), nil, "parse_date rejects garbage")
@@ -547,6 +567,26 @@ do
   ctx = make_ctx()
   cmd.dispatch(ctx, "/?")
   ok(ctx.helped, "/? aliases /help")
+
+  -- Every shorthand is the same handler function as its full command.
+  for _, row in ipairs(cmd.aliases) do
+    eq(cmd.handlers[row[1]], cmd.handlers[row[2]],
+      "/" .. row[1] .. " aliases /" .. row[2])
+  end
+  local help_aliases = {}
+  for _, entry in ipairs(cmd.help_entries) do
+    local target = entry[1]:match("^/(%a+)")
+    if entry[3] then help_aliases[target] = entry[3] end
+  end
+  for _, row in ipairs(cmd.aliases) do
+    eq(help_aliases[row[2]], row[1],
+      "help lists /" .. row[1] .. " beside /" .. row[2])
+  end
+  local handlers = { first = function() end, x = function() end }
+  local installed, install_err = pcall(cmd.install_aliases, handlers,
+    { { "x", "first" } })
+  ok(not installed and tostring(install_err):find("collision", 1, true),
+    "alias registration rejects an occupied letter")
 end
 
 -------------------------------------------------------------------------------
@@ -679,6 +719,12 @@ do
   eq(cmd.complete("/liner d"), "/liner desc ", "subverb completion")
   eq(cmd.complete("/open my", { liners = { "mystuff", "notes" } }),
     "/open mystuff ", "liner-name completion for /open")
+  eq(cmd.complete("/open label:work alpha", {
+      liners = { "Project Alpha" }, open_query = true,
+    }), "/open Project Alpha ",
+    "open-query completion replaces filters with the selected liner")
+  eq(cmd.complete("/r d"), "/r desc ",
+    "alias completion uses the full command's subverbs")
   local cands = cmd.candidates("/liner ", {})
   ok(#cands == 5, "trailing space lists all subverbs")
   eq(cmd.complete("/filter si"), "/filter since:", "filter key keeps the colon")

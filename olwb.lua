@@ -996,8 +996,9 @@ function compose_input()
   return out
 end
 
-function liner_names()
+function liner_names(query_text)
   local liners = list_liners()
+  local query = query_text ~= nil and olwb_cmd.parse_open_query(query_text) or nil
   -- A name shared by several liners is ambiguous for /open; offer those (and
   -- unnamed liners) as ids instead.
   local counts = {}
@@ -1006,17 +1007,26 @@ function liner_names()
   end
   local out = {}
   for _, l in ipairs(liners) do
+    local key
     if l.name ~= "" and counts[l.name] == 1 then
-      out[#out + 1] = l.name
+      key = l.name
     else
-      out[#out + 1] = l.id
+      key = l.id
+    end
+    if query_text == nil then
+      out[#out + 1] = key
+    else
+      local liner = load_liner(l.id)
+      if olwb_model.liner_matches_query(liner, key, query) then
+        out[#out + 1] = key
+      end
     end
   end
   return out
 end
 
 -- Dynamic completion pools handed to olwb_cmd.candidates everywhere.
-function cmd_extra()
+function cmd_extra(input)
   local dests = {}
   for _, d in ipairs(state and state.destinations or {}) do
     dests[#dests + 1] = d.name
@@ -1025,7 +1035,16 @@ function cmd_extra()
   for _, r in ipairs(state and state.issue_repos or {}) do
     repos[#repos + 1] = r.alias
   end
-  return { liners = liner_names(), dests = dests, repos = repos }
+  local raw_verb, open_query = (input or ""):match("^%s*/(%S+)%s+(.*)$")
+  local input_verb = raw_verb
+    and (olwb_cmd.alias_targets[raw_verb] or raw_verb) or nil
+  if input_verb ~= "open" then open_query = nil end
+  return {
+    liners = open_query ~= nil and liner_names(open_query) or liner_names(),
+    open_query = open_query ~= nil,
+    dests = dests,
+    repos = repos,
+  }
 end
 
 -- The /? help menu, filtered live by the verb being typed. Shown in the feed
@@ -1035,6 +1054,7 @@ end
 function menu_text(input)
   local verb = (input or ""):gsub("^%s*/", ""):match("^(%S*)") or ""
   if verb == "?" then verb = "" end
+  verb = olwb_cmd.alias_targets[verb] or verb
 
   local width = 76
   pcall(function() width = feed_pane:GetView().Width - 2 * #PAD - 2 end)
@@ -1052,7 +1072,8 @@ function menu_text(input)
   for _, e in ipairs(olwb_cmd.help_entries) do
     local v = e[1]:match("^/(%a+)") or ""
     if verb == "" or v:sub(1, #verb) == verb then
-      shown[#shown + 1] = { usage = e[1], desc = e[2], verb = v }
+      local usage = e[1] .. (e[3] and ("  (/" .. e[3] .. ")") or "")
+      shown[#shown + 1] = { usage = usage, desc = e[2], verb = v }
     end
   end
 
@@ -1090,7 +1111,7 @@ function menu_text(input)
   if cycle and cycle.kept ~= "/" then
     cands, sel, kept = cycle.cands, cycle.idx, cycle.kept
   elseif not cycle then
-    local c, _, k = olwb_cmd.candidates(input or "", cmd_extra())
+    local c, _, k = olwb_cmd.candidates(input or "", cmd_extra(input or ""))
     if k ~= "/" then cands, kept = c, k end
   end
   if cands and #cands > 0 then
@@ -1826,6 +1847,23 @@ function preInsertNewline(bp)
   for i = 0, n - 1 do parts[#parts + 1] = bp.Buf:Line(i) end
   local text = table.concat(parts, "\n")
 
+  -- With no liner open, bare text is a liner query rather than an implicit
+  -- write to a newly-created "notes" liner. Keep the query in the compose
+  -- buffer so the live /open results can be inspected and Tab-selected.
+  if not active_liner and not olwb_cmd.is_command(text)
+      and not olwb_model.is_blank(text) then
+    local query = olwb_model.trim(text):gsub("%s+", " ")
+    local search = "/open " .. query
+    set_buffer_text(bp.Buf, search)
+    bp.Cursor:GotoLoc(buffer.Loc(util.CharacterCountInString(search), 0))
+    overlay_kind = nil
+    cycle = nil
+    last_input = search
+    sync_compose_size()
+    rerender()
+    return false
+  end
+
   local last = bp.Buf:Line(n - 1)
   bp.Buf:Remove(buffer.Loc(0, 0), buffer.Loc(util.CharacterCountInString(last), n - 1))
   bp.Cursor:GotoLoc(buffer.Loc(0, 0))
@@ -1849,7 +1887,8 @@ end
 -- cycle. (Bare `function`: assigns the forward-declared local.)
 function cycle_step(bp, dir)
   if not cycle then
-    local cands, _, kept = olwb_cmd.candidates(compose_input(), cmd_extra())
+    local input = compose_input()
+    local cands, _, kept = olwb_cmd.candidates(input, cmd_extra(input))
     if #cands == 0 then return end
     cycle = { cands = cands, kept = kept, idx = 0 }
   end

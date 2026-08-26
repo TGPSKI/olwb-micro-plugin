@@ -132,40 +132,43 @@ Typing in any other olwb pane bounces focus (and the keystroke) back into
 the one line, so a stray mouse click never strands the keyboard.
 
 Nothing is loaded automatically on open: the one line is pre-filled with
-"/open <your most recent liner>" — press Enter to resume it, or clear the
-line and type something else. Messages auto-create a "notes" liner and a
-session if none is active. Typing "/" shows the command menu live, filtered
-as you type; the input grows automatically when a long line wraps.
+"/open <your most recent liner>" — press Enter to resume it, or replace it
+with a query. With no liner active, bare text becomes an `/open` search;
+`label:foo label:bar words` requires both liner labels and matches the words
+against liner names, ids, and descriptions. With a liner active, bare text is
+captured there. Typing "/" shows the command menu live, filtered as you type;
+the input grows automatically when a long line wraps.
 
 ## Slash commands (typed in the one line)
 
-    /new [name]                    create + activate a new liner
-    /open <name|id>                load + activate an existing liner
-    /close                         deactivate liner (ends its session)
-    /save                          force a save (saves are automatic)
+    /new [name]              /n    create + activate a new liner
+    /open <name|id|query>    /o    search for or activate a liner
+    /close                   /c    deactivate liner (ends its session)
+    /save                    /v    force a save (saves are automatic)
 
-    /liner start|end               start / end the active liner
+    /liner start|end         /r    start / end the active liner
     /liner name <s> | desc <s>     set liner name / description
     /liner label <l>               toggle a liner-level label
 
-    /session start|end             start / end a session
+    /session start|end       /u    start / end a session
     /session name <s>              name the active session
     /session label <l>             toggle a session-level label
 
-    /label <name>                  toggle a label applied to new messages
-    /labels                        list known labels with counts
+    /label <name>            /l    toggle a label applied to new messages
+    /labels                  /k    list known labels with counts
 
-    /filter label:<l> [since:<d>] [until:<d>] [term:<t>]
+    /filter label:<l> [since:<d>] [until:<d>] [term:<t>]  (/f)
     /filter clear                  remove the active filter
-    /search <term>                 substring search over the current scope
-    /export [md|json] [path]       write the current scope to a file
-    /list                          list liners with message counts
-    /help  (or /?)                 toggle the command menu
+    /search <term>           /q    substring search over the current scope
+    /export [md|json] [path] /e    write the current scope to a file
+    /list                    /a    list liners with message counts
+    /set [option] [value]    /t    view / change olwb options
+    /help  (or /?)           /h    toggle the command menu
 
-    /send <dest> [tui]             send the selection (or the whole current
+    /send <dest> [tui]       /s    send the selection (or the whole current
                                    scope) to a destination; `tui` opens the
                                    CLI interactively in a new terminal
-    /dest                          list destinations (overlay)
+    /dest                    /d    list destinations (overlay)
     /dest add <name> <cmd…>        add a destination (stdin pipe; kind is
                                    inferred from claude/codex/opencode)
     /dest rm <name>                remove a destination
@@ -174,7 +177,7 @@ as you type; the input grows automatically when a long line wraps.
     /dest session list             stored dest|liner → session mappings
     /dest session clear <name>     forget this liner's session for a dest
 
-    /issues draft [<repo>]         selection → agent-work issue drafts via a
+    /issues draft [<repo>]   /i    selection → agent-work issue drafts via a
                                    model; writes a reviewable gh script
     /issues open [<id|latest>]     open a draft's script in a new tab to review
     /issues file <id|latest>       run a reviewed script (files the issues)

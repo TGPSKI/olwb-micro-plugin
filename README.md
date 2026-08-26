@@ -60,15 +60,18 @@ Restart micro (or `> reload`). Then:
 > olwb                 open the olwb layout
 ```
 
-Type a line and press Enter. A `notes` liner and a session are created
-automatically on the first message.
+Run `/new notes`, then type a line and press Enter. To capture without creating
+a durable liner first, use `> olwb -i`; `/save <name>` keeps that instant liner
+and `/close` discards it.
 
 ## Usage
 
 | Key / command | Effect |
 |---|---|
 | `> olwb` | open / focus the olwb layout |
-| `Alt-o` | open / focus olwb (overridable) |
+| `Alt-o` | launch: open / focus olwb without selecting a liner |
+| `Alt-Shift-o` | resume the current or most recently updated durable liner |
+| `Alt-Shift-i` | enter a memory-only instant liner |
 | `Alt-m` | jump to the one line |
 | *type + Enter* | capture the line as a message (appears just below the input) |
 | `/…` + Enter | run a slash command instead of capturing |
@@ -78,6 +81,17 @@ automatically on the first message.
 | `Space` | during `/open` cycling: expand the selection's details |
 | `Shift-Tab` (plain line) | browse the feed message by message (see below); Shift-Tab or typing returns |
 | `Alt-i` | toggle between the active liner and the inbox (responses land there); a second Alt-i returns |
+
+The three entry functions are bindable as `lua:olwb.launch`,
+`lua:olwb.resume`, and `lua:olwb.instant`. Their default chords are registered
+with overwrite disabled, so an existing user binding wins. Alt-i remains the
+inbox toggle; instant uses Alt-Shift-i.
+
+`> olwb -i` enters instant mode without a liner file, registry row, or durable
+session state. Captures can still be selected, sent, exported, or used for an
+issues draft. `/save <name>` promotes the in-memory liner through the ordinary
+save path; switching to another liner, `/close`, resume, or editor exit
+discards it.
 
 ### Browse mode — navigate, select, send
 
@@ -101,7 +115,7 @@ the selection it sent; selections made while that send was running remain.
 /new [name]              /n    create + activate a new liner
 /open <name|id|query>    /o    search for or activate a liner
 /close                   /c    deactivate liner (ends its session)
-/save                    /v    force a save (saves are automatic)
+/save [name]             /v    save; name promotes an instant liner
 
 /liner start|end         /r    start / end the active liner
 /liner name <s> | desc <s>     set liner name / description
@@ -223,6 +237,8 @@ well-formed issues. The full guide is [docs/issues.md](docs/issues.md).
 ```
 > olwb rescan            rebuild the liner registry from disk
 > olwb selftest          run built-in storage self-tests (writes a report buffer)
+> olwb -i                enter a memory-only instant liner
+> olwb resume            activate the most recently updated durable liner
 ```
 
 ### Options
@@ -241,6 +257,11 @@ work if you prefer them.
 | `olwb.rulewidth` | `48` | width of the feed separator rules |
 | `olwb.termcmd` | *(auto)* | terminal for `/send <dest> tui` (lives in state.json) |
 | `olwb.theme` | `false` | apply the bundled `olwb` colorscheme |
+
+For one launch, `OLWB_AUTOSTART=1 micro [file]` opens olwb even when a file is
+also given, without changing settings. `micro -olwb.autostart true` does not
+work: micro parses CLI flags before plugins register their options. The
+persisted `olwb.autostart` option remains limited to launches with no file.
 
 The feed uses the `olwb` filetype, so its rule lines, timestamps and `#labels`
 pick up colours from your own colorscheme by default. An optional `olwb`

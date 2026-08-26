@@ -36,7 +36,7 @@ M.help_entries = {
   { "/new [name]",            "create + activate a new liner", "n" },
   { "/open <name|id|query>",  "search for or activate a liner", "o" },
   { "/close",                 "deactivate the liner (ends its session)", "c" },
-  { "/save",                  "force a save (saves are automatic)", "v" },
+  { "/save [name]",           "save; name promotes an instant liner", "v" },
   { "/liner name|desc|label|start|end",  "manage the active liner", "r" },
   { "/session name|label|start|end",     "manage the active session", "u" },
   { "/label <name>",          "toggle a label applied to new messages", "l" },
@@ -267,13 +267,22 @@ end
 
 H["close"] = function(ctx)
   if not ctx.get_active_liner() then ctx.error("no active liner") return end
+  local was_instant = ctx.is_instant()
   ctx.close_liner()
-  ctx.info("closed liner")
+  ctx.info(was_instant and "discarded instant liner" or "closed liner")
   ctx.rerender()
 end
 
-H["save"] = function(ctx)
+H["save"] = function(ctx, args, rest)
   if not ctx.get_active_liner() then ctx.error("no active liner") return end
+  if ctx.is_instant() then
+    local name = ctx.model.trim(rest)
+    if name == "" then ctx.error("usage: /save <name>") return end
+    ctx.promote_instant(name)
+    ctx.info("saved instant liner as " .. name)
+    ctx.rerender()
+    return
+  end
   ctx.save_active()
   ctx.info("saved")
 end
@@ -288,8 +297,9 @@ H["liner"] = function(ctx, args, rest)
     ctx.rerender()
   elseif sub == "end" then
     if not ctx.get_active_liner() then ctx.error("no active liner") return end
+    local was_instant = ctx.is_instant()
     ctx.close_liner()
-    ctx.info("ended liner")
+    ctx.info(was_instant and "discarded instant liner" or "ended liner")
     ctx.rerender()
   elseif sub == "name" then
     local liner = ctx.require_active_liner(); if not liner then return end
@@ -324,12 +334,12 @@ H["session"] = function(ctx, args, rest)
     ctx.end_session(liner)
     ctx.save_active(); ctx.info("ended session"); ctx.rerender()
   elseif sub == "name" then
-    local s = ctx.model.active_session(liner, ctx.state)
+    local s = ctx.active_session(liner)
     if not s then ctx.error("no active session") return end
     s.metadata.name = subrest
     ctx.save_active(); ctx.info("session name set"); ctx.rerender()
   elseif sub == "label" then
-    local s = ctx.model.active_session(liner, ctx.state)
+    local s = ctx.active_session(liner)
     if not s then ctx.error("no active session") return end
     if subrest == "" then ctx.error("usage: /session label <name>") return end
     local now = ctx.model.toggle_label(s.metadata.labels, subrest)

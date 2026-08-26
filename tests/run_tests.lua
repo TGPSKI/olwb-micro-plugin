@@ -96,6 +96,14 @@ do
   eq(model.trim("  hi \n\n"), "hi", "trim strips surrounding whitespace")
   eq(model.trim("\n\n\n"), "", "trim all-whitespace -> empty")
   ok(model.is_blank("   "), "is_blank on whitespace")
+  ok(model.should_autostart(false, "1", false),
+    "environment autostart overrides a file-backed launch")
+  ok(model.should_autostart(true, "", true),
+    "configured autostart accepts an empty launch buffer")
+  ok(not model.should_autostart(true, "", false),
+    "configured autostart rejects a file-backed launch")
+  ok(not model.should_autostart(false, "", true),
+    "unset autostart leaves an empty launch buffer alone")
 
   local l = {}
   eq(model.toggle_label(l, "x"), true, "toggle adds label")
@@ -467,6 +475,7 @@ do
   local function make_ctx()
     local state = { activeLabels = {}, filter = nil, liners = {} }
     local liner = nil
+    local instant = false
     local msgs = {}
     local ctx
     ctx = {
@@ -479,6 +488,7 @@ do
     ctx.info = function(m) ctx.infos[#ctx.infos + 1] = m end
     ctx.error = function(m) ctx.errors[#ctx.errors + 1] = m end
     ctx.get_active_liner = function() return liner end
+    ctx.is_instant = function() return instant end
     ctx.require_active_liner = function()
       if not liner then ctx.error("no active liner") return nil end
       return liner
@@ -491,6 +501,11 @@ do
     ctx.open_liner = function() return nil end
     ctx.close_liner = function() liner = nil end
     ctx.save_active = function() end
+    ctx.promote_instant = function(name)
+      liner.metadata.name = name
+      instant = false
+      ctx.promoted = name
+    end
     ctx.save_state = function() end
     ctx.start_session = function(l)
       local s = model.new_session("S", ctx.now())
@@ -499,6 +514,7 @@ do
       return s
     end
     ctx.end_session = function() state.activeSessionId = nil end
+    ctx.active_session = function(l) return model.active_session(l, state) end
     ctx.submit_message = function(text)
       local l = liner or ctx.create_liner("notes")
       local s = model.active_session(l, state) or ctx.start_session(l)
@@ -513,6 +529,10 @@ do
     ctx.open_help = function() ctx.helped = true end
     ctx.show_options = function() ctx.optioned = true end
     ctx.set_option = function(n, v) ctx.setopt = { n, v }; return true end
+    ctx.make_instant = function()
+      liner = model.new_liner("I", "", "")
+      instant = true
+    end
     return ctx
   end
 
@@ -527,6 +547,15 @@ do
   ctx = make_ctx()
   cmd.dispatch(ctx, "/new project x")
   ok(ctx.get_active_liner() ~= nil, "/new creates active liner")
+
+  ctx = make_ctx()
+  ctx.make_instant()
+  cmd.dispatch(ctx, "/save")
+  ok(ctx.errors[1] == "usage: /save <name>",
+    "instant /save requires a durable name")
+  cmd.dispatch(ctx, "/save quick note")
+  eq(ctx.promoted, "quick note", "instant /save promotes with the full name")
+  ok(not ctx.is_instant(), "instant promotion enters durable mode")
 
   -- /msg was removed: it must be unknown now.
   ctx = make_ctx()

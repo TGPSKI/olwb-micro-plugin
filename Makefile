@@ -3,7 +3,7 @@
 
 LUA ?= lua
 
-.PHONY: all check test harness clean-run
+.PHONY: all check test harness e2e-autostart clean-run
 
 all: check
 
@@ -17,6 +17,10 @@ test:
 ## harness: load the whole plugin under a mocked micro API and drive a capture
 harness:
 	@$(LUA) tests/harness.lua
+
+## e2e-autostart: verify OLWB_AUTOSTART in isolated real-micro tmux sessions
+e2e-autostart:
+	@bash tests/autostart_tmux.sh
 
 ## install: symlink this repo into micro's plugin directory
 install:

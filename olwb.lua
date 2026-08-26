@@ -27,7 +27,7 @@ local PAD = "  "     -- horizontal padding applied to every rendered line
 -- Options manageable from inside the UI via /set (kept in sync with the
 -- RegisterCommonOption calls in init and cmd.lua's subverbs.set).
 local OPTION_DOCS = {
-  { "autostart",   "open olwb when micro starts with no file" },
+  { "autostart",   "open on no-file launch; OLWB_AUTOSTART overrides" },
   { "composesize", "minimum one-line height in rows" },
   { "datadir",     "storage dir (empty = $XDG_DATA_HOME/olwb)" },
   { "rulewidth",   "feed separator width" },
@@ -39,6 +39,8 @@ local OPTION_DOCS = {
 -- Runtime state (module-local; not in the shared plugin table).
 local state          -- the persisted state table (see store.default_state)
 local active_liner   -- currently loaded liner table, or nil
+local instant_mode = false
+local instant_session_id
 local title_pane     -- one-row branding line at the very top
 local compose_pane   -- BufPane holding the compose line
 local feed_pane      -- BufPane showing the feed (or the /? menu overlay)
@@ -65,8 +67,10 @@ local job_queue = {}       -- finished jobs awaiting main-state processing
 -- (function foo() assigns to the in-scope local, not a new global).
 local rerender, submit_message, build_ctx, save_active, feed_text
 local create_liner, open_liner, close_liner, start_session, end_session
+local create_instant, promote_instant, discard_instant, current_session
 local load_liner, persist_registry, list_liners, do_export, open_help
 local open_olwb, do_migrate, rescan, selftest
+local recent_liner_key
 local compose_input, menu_text, bar_text, liner_names, layout_panes
 local sync_compose_size, show_options, set_option
 local cmd_extra, send_to, send_tui, deliver_response, selection_entries
@@ -124,6 +128,7 @@ end
 
 function save_active()
   if not active_liner then return end
+  if instant_mode then return true end
   olwb_store.save_liner(active_liner)
   persist_registry(active_liner)
   olwb_store.save_state(state)
@@ -134,6 +139,7 @@ function load_liner(id)
 end
 
 function create_liner(name, desc)
+  if instant_mode then discard_instant() end
   local liner = olwb_model.new_liner(new_id(), name or "", desc or "")
   active_liner = liner
   state.activeLinerId = liner.id
@@ -157,6 +163,7 @@ function open_liner(key)
   if not id then return nil end
   local liner = load_liner(id)
   if not liner then return nil end
+  if instant_mode then discard_instant() end
   active_liner = liner
   state.activeLinerId = id
   -- Opening a liner clears its unread badge (responses have been "seen").
@@ -171,22 +178,79 @@ function open_liner(key)
   return liner
 end
 
+function current_session(liner)
+  if instant_mode and liner == active_liner then
+    local s = olwb_model.find_session(liner, instant_session_id)
+    if s and (s.endTime == nil or s.endTime == 0) then return s end
+    return nil
+  end
+  return olwb_model.active_session(liner, state)
+end
+
 function start_session(liner)
-  local cur = olwb_model.active_session(liner, state)
+  local cur = current_session(liner)
   if cur then cur.endTime = now_ms() end
   local s = olwb_model.new_session(new_id(), now_ms())
   liner.sessions[#liner.sessions + 1] = s
-  state.activeSessionId = s.id
+  if instant_mode and liner == active_liner then
+    instant_session_id = s.id
+  else
+    state.activeSessionId = s.id
+  end
   return s
 end
 
 function end_session(liner)
-  local s = olwb_model.active_session(liner, state)
+  local s = current_session(liner)
   if s then s.endTime = now_ms() end
-  state.activeSessionId = nil
+  if instant_mode and liner == active_liner then
+    instant_session_id = nil
+  else
+    state.activeSessionId = nil
+  end
+end
+
+function discard_instant()
+  if not instant_mode then return false end
+  local id = active_liner and active_liner.id or nil
+  if id then
+    local suffix = "|" .. id
+    for key in pairs(state.dest_sessions or {}) do
+      if key:sub(-#suffix) == suffix then state.dest_sessions[key] = nil end
+    end
+  end
+  active_liner = nil
+  instant_mode = false
+  instant_session_id = nil
+  selected = {}
+  olwb_store.save_state(state)
+  return true
+end
+
+function create_instant()
+  if instant_mode and active_liner then return active_liner end
+  if active_liner then save_active() end
+  active_liner = olwb_model.new_liner(new_id(), "", "")
+  instant_mode = true
+  instant_session_id = nil
+  selected = {}
+  return active_liner
+end
+
+function promote_instant(name)
+  if not instant_mode or not active_liner then return nil end
+  active_liner.metadata.name = name
+  local session_id = instant_session_id
+  instant_mode = false
+  instant_session_id = nil
+  state.activeLinerId = active_liner.id
+  state.activeSessionId = session_id
+  save_active()
+  return active_liner
 end
 
 function close_liner()
+  if discard_instant() then return true end
   if active_liner then
     olwb_store.backup_liner(active_liner.id)
     end_session(active_liner)
@@ -203,7 +267,7 @@ function submit_message(text)
   if text == "" then return end
   if not active_liner then create_liner("notes", "") end
   local liner = active_liner
-  local sess = olwb_model.active_session(liner, state)
+  local sess = current_session(liner)
   if not sess then sess = start_session(liner) end
   local msg = olwb_model.new_message(new_id(), text, now_ms(),
     olwb_model.copy_list(state.activeLabels))
@@ -458,13 +522,16 @@ function deliver_response(into_name, content, label)
     label and { label } or {})
   target.directMessages = target.directMessages or {}
   target.directMessages[#target.directMessages + 1] = msg
-  olwb_store.save_liner(target)
-  persist_registry(target)
+  local transient = is_active and instant_mode
+  if not transient then
+    olwb_store.save_liner(target)
+    persist_registry(target)
+  end
   if not is_active then
     state.unread = state.unread or {}
     state.unread[target.id] = (state.unread[target.id] or 0) + 1
   end
-  olwb_store.save_state(state)
+  if not transient then olwb_store.save_state(state) end
   rerender() -- feed (if target is active) and the bar badge/count
   return target.id
 end
@@ -547,7 +614,9 @@ function send_to(name, mode, is_retry, attempt)
     if not entries then err(serr) return end
     if #entries == 0 then err("nothing to send (empty scope)") return end
     local source_name = active_liner.metadata.name
-    if source_name == "" then
+    if instant_mode then
+      source_name = "(instant)"
+    elseif source_name == "" then
       source_name = olwb_render.short_id(active_liner.id)
     end
     local selected_at_start = {}
@@ -560,6 +629,8 @@ function send_to(name, mode, is_retry, attempt)
         { fmt_time = fmt_time }),
       n = #entries,
       source_name = source_name,
+      source_liner_id = active_liner.id,
+      instant = instant_mode,
       skey = d.name .. "|" .. active_liner.id,
       selected = selected_at_start,
     }
@@ -626,7 +697,9 @@ function send_to(name, mode, is_retry, attempt)
           rerender()
           return
         end
-        if parsed.session_id then
+        local source_still_active = active_liner
+          and active_liner.id == attempt.source_liner_id
+        if parsed.session_id and (not attempt.instant or source_still_active) then
           state.dest_sessions = state.dest_sessions or {}
           state.dest_sessions[skey] = parsed.session_id
           olwb_store.save_state(state)
@@ -727,9 +800,11 @@ local function label_messages(liner_id, message_ids, label)
   end
   for _, s in ipairs(target.sessions or {}) do mark(s.messages) end
   mark(target.directMessages)
-  olwb_store.save_liner(target)
-  persist_registry(target)
-  olwb_store.save_state(state)
+  if not (is_active and instant_mode) then
+    olwb_store.save_liner(target)
+    persist_registry(target)
+    olwb_store.save_state(state)
+  end
   if is_active then rerender() end
 end
 
@@ -1210,9 +1285,9 @@ function bar_text()
   local ln = "(none — /new or /open)"
   local sn = "(none)"
   if active_liner then
-    ln = active_liner.metadata.name
+    ln = instant_mode and "(instant)" or active_liner.metadata.name
     if ln == "" then ln = olwb_render.short_id(active_liner.id) end
-    local s = olwb_model.active_session(active_liner, state)
+    local s = current_session(active_liner)
     if s then
       sn = s.metadata.name
       if sn == "" then sn = olwb_render.short_id(s.id) end
@@ -1433,6 +1508,7 @@ function build_ctx()
     info = info,
     error = err,
     get_active_liner = function() return active_liner end,
+    is_instant = function() return instant_mode end,
     require_active_liner = function()
       if not active_liner then err("no active liner (use /new)"); return nil end
       return active_liner
@@ -1440,10 +1516,12 @@ function build_ctx()
     create_liner = create_liner,
     open_liner = open_liner,
     close_liner = close_liner,
+    promote_instant = promote_instant,
     save_active = save_active,
     save_state = function() olwb_store.save_state(state) end,
     start_session = start_session,
     end_session = end_session,
+    active_session = current_session,
     submit_message = submit_message,
     rerender = rerender,
     set_filter = function(f) state.filter = f; olwb_store.save_state(state) end,
@@ -1597,11 +1675,8 @@ function sync_compose_size()
   end)
 end
 
--- Nothing is auto-loaded on open; instead the compose line is pre-populated
--- with the command that would resume the most recent liner, ready for Enter
--- (or for clearing and typing something else).
-local function prefill_resume()
-  if active_liner then return end
+function recent_liner_key()
+  if active_liner and not instant_mode then return active_liner.id end
   local key = nil
   if state.activeLinerId and state.liners[state.activeLinerId] then
     local meta = state.liners[state.activeLinerId]
@@ -1612,6 +1687,15 @@ local function prefill_resume()
       key = recent[1].name ~= "" and recent[1].name or recent[1].id
     end
   end
+  return key
+end
+
+-- Nothing is auto-loaded on open; instead the compose line is pre-populated
+-- with the command that would resume the most recent liner, ready for Enter
+-- (or for clearing and typing something else).
+local function prefill_resume()
+  if active_liner then return end
+  local key = recent_liner_key()
   if not key then return end
   pcall(function()
     local buf = compose_pane.Buf
@@ -1801,11 +1885,13 @@ end
 function olwb_command(bp, args)
   local a = to_table(args)
   local verb = a[1]
-  if not verb then open_olwb(); return end
+  if not verb then launch(bp); return end
+  if verb == "-i" or verb == "instant" then instant(bp); return end
+  if verb == "resume" then resume(bp); return end
   if verb == "migrate" then do_migrate(a[2]); return end
   if verb == "selftest" then selftest(); return end
   if verb == "rescan" then rescan(); return end
-  if verb == "open" and not a[2] then open_olwb(); return end
+  if verb == "open" and not a[2] then launch(bp); return end
   if not ui_open then open_olwb() end
   olwb_cmd.dispatch(build_ctx(), "/" .. table.concat(a, " "))
 end
@@ -2125,10 +2211,11 @@ end
 function statusinfo(b)
   local parts = {}
   if active_liner then
-    local ln = active_liner.metadata and active_liner.metadata.name or ""
+    local ln = instant_mode and "instant"
+      or (active_liner.metadata and active_liner.metadata.name or "")
     if ln == "" then ln = olwb_render.short_id(active_liner.id) end
     parts[#parts + 1] = ln
-    local s = olwb_model.active_session(active_liner, state)
+    local s = current_session(active_liner)
     if s then
       local sn = s.metadata and s.metadata.name or ""
       if sn == "" then sn = olwb_render.short_id(s.id) end
@@ -2146,7 +2233,50 @@ function statusinfo(b)
   return table.concat(parts, " ")
 end
 
-function key_open(bp) open_olwb(); return true end
+function launch(bp)
+  open_olwb()
+  return true
+end
+
+function resume(bp)
+  open_olwb()
+  if instant_mode then
+    discard_instant()
+    pcall(function() set_buffer_text(compose_pane.Buf, "") end)
+  end
+  local key = recent_liner_key()
+  if not key then return launch(bp) end
+  if open_liner(key) then
+    pcall(function() set_buffer_text(compose_pane.Buf, "") end)
+    focus(compose_pane)
+    rerender()
+  end
+  return true
+end
+
+function instant(bp)
+  local already_instant = instant_mode
+  open_olwb()
+  if already_instant then
+    focus(compose_pane)
+    return true
+  end
+  local prior_input = compose_input()
+  create_instant()
+  if prior_input:match("^%s*/open%s") then
+    pcall(function() set_buffer_text(compose_pane.Buf, "") end)
+    prior_input = ""
+  end
+  overlay_kind = nil
+  cycle = nil
+  last_input = prior_input
+  focus(compose_pane)
+  rerender()
+  info("instant liner — /save <name> keeps it; /close discards it")
+  return true
+end
+
+function key_open(bp) return launch(bp) end
 function key_compose(bp)
   reset_feed_scroll()
   focus(compose_pane)
@@ -2158,6 +2288,11 @@ end
 -- returns. Creates inbox on first use.
 function key_inbox(bp)
   if not ui_open then open_olwb() end
+  local instant_return_key
+  if instant_mode then
+    instant_return_key = state.activeLinerId
+    discard_instant()
+  end
   save_active()
   if active_liner and active_liner.metadata.name == "inbox" then
     if prev_liner_key and open_liner(prev_liner_key) then
@@ -2165,7 +2300,8 @@ function key_inbox(bp)
         and active_liner.metadata.name or olwb_render.short_id(active_liner.id)))
     end
   else
-    prev_liner_key = active_liner and active_liner.id or nil
+    prev_liner_key = instant_return_key
+      or (active_liner and active_liner.id or nil)
     if not open_liner("inbox") then create_liner("inbox", "") end
     info("inbox")
   end
@@ -2245,7 +2381,9 @@ function init()
   micro.SetStatusInfoFn("olwb.statusinfo")
 
   -- Overridable keybinds (best-effort; failures are non-fatal).
-  pcall(function() config.TryBindKey("Alt-o", "lua:olwb.key_open", false) end)
+  pcall(function() config.TryBindKey("Alt-o", "lua:olwb.launch", false) end)
+  pcall(function() config.TryBindKey("Alt-O", "lua:olwb.resume", false) end)
+  pcall(function() config.TryBindKey("Alt-I", "lua:olwb.instant", false) end)
   pcall(function() config.TryBindKey("Alt-m", "lua:olwb.key_compose", false) end)
   pcall(function() config.TryBindKey("Alt-i", "lua:olwb.key_inbox", false) end)
 
@@ -2253,16 +2391,21 @@ function init()
     pcall(function() config.SetGlobalOption("colorscheme", "olwb") end)
   end
 
-  if opt("autostart") == true then
-    local bp = micro.CurPane()
-    local emptyish = false
-    pcall(function()
-      emptyish = bp and bp.Buf and bp.Buf.Path == "" and not bp.Buf:Modified()
-    end)
-    if emptyish then open_olwb() end
+  local bp = micro.CurPane()
+  local emptyish = false
+  pcall(function()
+    emptyish = bp and bp.Buf and bp.Buf.Path == "" and not bp.Buf:Modified()
+  end)
+  if olwb_model.should_autostart(
+      opt("autostart"), goos.Getenv("OLWB_AUTOSTART"), emptyish) then
+    open_olwb()
   end
 end
 
 function deinit()
-  if state then olwb_store.save_state(state) end
+  if instant_mode then
+    discard_instant()
+  elseif state then
+    olwb_store.save_state(state)
+  end
 end

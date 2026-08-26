@@ -28,6 +28,7 @@ local function sh_quote(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" e
 local mock = {}
 
 mock["os"] = {
+  O_CREATE = 1, O_EXCL = 2, O_WRONLY = 4,
   Getenv = function(k)
     if k == "XDG_DATA_HOME" then return datadir end
     return os.getenv(k) or ""
@@ -38,8 +39,19 @@ mock["os"] = {
     if f then f:close(); return {}, nil end
     return nil, "not found"
   end,
-  Rename = function(a, b) return os.rename(a, b) and nil or "rename failed" end,
+  Rename = function(a, b)
+    local renamed, err = os.rename(a, b)
+    if renamed then return nil end
+    return err or "rename failed"
+  end,
   Remove = function(path) os.remove(path); return nil end,
+  OpenFile = function(path)
+    local existing = io.open(path, "r")
+    if existing then existing:close(); return nil, "exists" end
+    local f = io.open(path, "w")
+    if not f then return nil, "cannot open" end
+    return { Close = function() f:close(); return nil end }, nil
+  end,
   Getpid = function() return 4242 end,
 }
 
@@ -168,17 +180,40 @@ mock["micro/buffer"] = {
 }
 
 mock["time"] = {
+  Millisecond = 1000000,
+  Second = 1000000000,
+  Sleep = function() end,
+  Since = function(t) return (os.clock() - t._clock) * 1000000000 end,
   Now = function()
-    return { UnixMilli = function() return math.floor(os.clock() * 1000) + os.time() * 1000 end }
+    local clock = os.clock()
+    return {
+      _clock = clock,
+      UnixMilli = function() return math.floor(clock * 1000) + os.time() * 1000 end,
+    }
   end,
 }
 
--- micro/shell: jobs are no-ops (the executor paths are exercised in the tmux
--- end-to-end run); ExecCommand pretends nothing is installed so the
--- destination seeding takes its fallback branches.
+-- micro/shell: capture jobs so the harness can finish them deterministically.
+-- ExecCommand pretends nothing is installed so destination seeding takes its
+-- fallback branches.
 local job_log = {}
 mock["micro/shell"] = {
-  JobStart = function(cmd) job_log[#job_log + 1] = cmd; return {} end,
+  JobStart = function(cmd, _, _, on_exit)
+    local stdin_path = cmd:match("< '([^']+)'")
+    local payload
+    if stdin_path then
+      local f = io.open(stdin_path, "rb")
+      if f then payload = f:read("*a"); f:close() end
+    end
+    job_log[#job_log + 1] = {
+      cmd = cmd,
+      on_exit = on_exit,
+      out = cmd:match("> '([^']+%.out)'"),
+      err = cmd:match("2> '([^']+%.err)'"),
+      payload = payload,
+    }
+    return {}
+  end,
   JobSpawn = function() return {} end,
   ExecCommand = function() return "", "not found" end,
   RunCommand = function() return "", "not found" end,
@@ -267,6 +302,99 @@ ok(okc2, "slash command via preInsertNewline runs")
 -- selftest should pass internally (writes a scratch buffer; just ensure no error)
 local oksel = pcall(ENV.olwb_command, nil, {})   -- bare >olwb opens UI
 ok(oksel, ">olwb (bare) runs")
+
+local function submit_command(line)
+  return pcall(ENV.preInsertNewline,
+    new_mock_pane(new_mock_buffer(line, "olwb://compose")))
+end
+
+local function last_executor_job()
+  for i = #job_log, 1, -1 do
+    if job_log[i].out then return job_log[i] end
+  end
+end
+
+local function finish_job(job, stdout, stderr)
+  local out = assert(io.open(job.out, "wb")); out:write(stdout or ""); out:close()
+  local err = assert(io.open(job.err, "wb")); err:write(stderr or ""); err:close()
+  job.on_exit()
+  ENV.onAnyEvent()
+end
+
+local function fixture(name)
+  local f = assert(io.open(root .. "tests/fixtures/" .. name, "rb"))
+  local s = f:read("*a"); f:close(); return s
+end
+
+-- A successful adapted send seeds a resumable destination session.
+ok(submit_command("/send claude"), "first adapted send starts")
+local seed_job = last_executor_job()
+assert(seed_job, job_log[#job_log] and job_log[#job_log].cmd
+  or (err_log[#err_log] or "no jobs"))
+finish_job(seed_job, fixture("claude-response.json"), "")
+
+-- A stale-session retry must reuse the first attempt's bytes. A message and
+-- selection created during the async gap must survive its eventual success.
+ok(submit_command("/send claude"), "resumed send starts")
+local stale_job = last_executor_job()
+local late = new_mock_buffer("late captured line", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(late)),
+  "message can be captured while send is pending")
+ENV.preOutdentSelection(new_mock_pane(new_mock_buffer("", "olwb://compose")))
+ENV.preRune(new_mock_pane(new_mock_buffer("", "olwb://feed")), " ")
+finish_job(stale_job, "", "stale session\nolwb-job-failed\n")
+local retry_job = last_executor_job()
+ok(retry_job ~= stale_job, "stale session starts one fresh retry")
+ok(retry_job.payload == stale_job.payload,
+  "fresh retry reuses the original payload bytes")
+finish_job(retry_job, fixture("claude-response.json"), "")
+
+ok(submit_command("/send file"), "post-completion selection can be sent")
+local selection_job = last_executor_job()
+ok(selection_job.payload and selection_job.payload:find("late captured line", 1, true),
+  "selection made during send survives completion")
+ok(selection_job.payload and not selection_job.payload:find("first captured line", 1, true),
+  "surviving selection scopes the next send")
+
+-- Filing is single-flight: a second command starts no executor, but a failed
+-- first run releases the guard and leaves the draft retryable.
+local issue_id = "guard-test"
+local issue_script = datadir .. "/olwb/issues/" .. issue_id .. ".sh"
+ENV.olwb_store.write_file_atomic(issue_script, "#!/bin/sh\n")
+ENV.olwb_store.write_file_atomic(datadir .. "/olwb/issues/" .. issue_id .. ".json",
+  ENV.olwb_json.encode({ id = issue_id, status = "drafted", count = 1,
+    repo = "owner/repo", script = issue_script, message_ids = {} }))
+local before_file = #job_log
+ok(submit_command("/issues file " .. issue_id), "first issue filing starts")
+local file_job = last_executor_job()
+local after_first_file = #job_log
+ok(submit_command("/issues file " .. issue_id), "duplicate filing is handled")
+ok(#job_log == after_first_file, "duplicate filing starts no second job")
+ok(after_first_file > before_file, "first filing created a job")
+finish_job(file_job, "", "filing failed\nolwb-job-failed\n")
+ok(submit_command("/issues file " .. issue_id), "filing can retry after completion")
+ok(#job_log > after_first_file, "completed filing releases the in-flight guard")
+
+-- Simulate another micro instance changing the on-disk session map between
+-- saves. Local additions and deletions must apply without dropping its keys.
+local stale_state = ENV.olwb_store.load_state()
+stale_state.dest_sessions.local_a = "a"
+ok(ENV.olwb_store.save_state(stale_state), "local session state saves")
+local disk = ENV.olwb_json.decode(ENV.olwb_store.read_file(ENV.olwb_store.state_path()))
+disk.dest_sessions.remote_b = "b"
+ENV.olwb_store.write_file_atomic(ENV.olwb_store.state_path(), ENV.olwb_json.encode(disk))
+stale_state.dest_sessions.local_c = "c"
+ok(ENV.olwb_store.save_state(stale_state), "stale state merges remote session additions")
+disk = ENV.olwb_json.decode(ENV.olwb_store.read_file(ENV.olwb_store.state_path()))
+ok(disk.dest_sessions.local_a == "a" and disk.dest_sessions.local_c == "c"
+  and disk.dest_sessions.remote_b == "b", "all concurrent session ids survive")
+disk.dest_sessions.remote_d = "d"
+ENV.olwb_store.write_file_atomic(ENV.olwb_store.state_path(), ENV.olwb_json.encode(disk))
+stale_state.dest_sessions.local_a = nil
+ok(ENV.olwb_store.save_state(stale_state), "local session deletion saves")
+disk = ENV.olwb_json.decode(ENV.olwb_store.read_file(ENV.olwb_store.state_path()))
+ok(disk.dest_sessions.local_a == nil and disk.dest_sessions.remote_b == "b"
+  and disk.dest_sessions.remote_d == "d", "session deletion preserves remote keys")
 
 io.write(string.format("\nharness: %d passed, %d failed\n", passed, failed))
 io.write("datadir: " .. datadir .. "/olwb\n")

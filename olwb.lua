@@ -534,23 +534,40 @@ function send_tui(d, payload, skey, n)
     .. (sid and "resumed session" or "fresh session") .. ")")
 end
 
--- Headless /send. is_retry guards the one automatic fresh retry after a
--- resumed session fails (C3's stale-session rule).
-function send_to(name, mode, is_retry)
+-- A stale-session retry reuses attempt so mid-flight editor changes cannot
+-- alter its payload or provenance. is_retry bounds recovery to one fresh try.
+function send_to(name, mode, is_retry, attempt)
   local d = find_dest_state(name)
   if not d then
     err("no destination '" .. tostring(name) .. "' (/dest add, /dest lists)")
     return
   end
-  local entries, serr = selection_entries()
-  if not entries then err(serr) return end
-  if #entries == 0 then err("nothing to send (empty scope)") return end
-  local payload = olwb_render.render_selection_md(active_liner, entries,
-    { fmt_time = fmt_time })
-  local n = #entries
-  local source_name = active_liner.metadata.name
-  if source_name == "" then source_name = olwb_render.short_id(active_liner.id) end
-  local skey = d.name .. "|" .. active_liner.id
+  if not attempt then
+    local entries, serr = selection_entries()
+    if not entries then err(serr) return end
+    if #entries == 0 then err("nothing to send (empty scope)") return end
+    local source_name = active_liner.metadata.name
+    if source_name == "" then
+      source_name = olwb_render.short_id(active_liner.id)
+    end
+    local selected_at_start = {}
+    for _, entry in ipairs(entries) do
+      local id = entry.message.id
+      if selected[id] then selected_at_start[id] = true end
+    end
+    attempt = {
+      payload = olwb_render.render_selection_md(active_liner, entries,
+        { fmt_time = fmt_time }),
+      n = #entries,
+      source_name = source_name,
+      skey = d.name .. "|" .. active_liner.id,
+      selected = selected_at_start,
+    }
+  end
+  local payload = attempt.payload
+  local n = attempt.n
+  local source_name = attempt.source_name
+  local skey = attempt.skey
 
   if mode == "tui" then
     if not d.kind then
@@ -590,7 +607,7 @@ function send_to(name, mode, is_retry)
           state.dest_sessions[skey] = nil
           olwb_store.save_state(state)
           info(d.name .. ": stored session failed, retrying fresh…")
-          send_to(name, mode, true)
+          send_to(name, mode, true, attempt)
           return
         end
         if failed then
@@ -630,7 +647,7 @@ function send_to(name, mode, is_retry)
           .. " from " .. source_name
         deliver_response(d.into, prov .. "\n" .. response_text, d.name)
       end
-      selected = {}
+      for id in pairs(attempt.selected) do selected[id] = nil end
       rerender()
       info("sent " .. n .. " message(s) to " .. d.name)
     end)
@@ -877,6 +894,10 @@ end
 
 -- Stage 2: run the reviewed gh script. Never called automatically.
 function issues_file(id)
+  if (pending_jobs.issues or 0) > 0 then
+    err("issues job already in progress")
+    return
+  end
   local manifest, merr = find_manifest(id)
   if not manifest then err(merr) return end
   if manifest.status ~= "drafted" then

@@ -7,6 +7,11 @@ All notable changes to olwb are documented here. Format loosely follows
 
 ### Added
 
+- **Open-view queries**: `/open` candidates now accept repeated `label:`
+  tokens (ANDed against liner labels) plus case-insensitive text matched
+  against liner names, ids, and descriptions.
+- **Command aliases**: every top-level slash command has a collision-checked
+  single-letter alias shown beside it in the live `/?` menu and help.
 - **Errors in the feed**: workflow failures (`/send`, `/issues draft`,
   `/issues file`) now land as persistent `⚠ error`-labeled messages — in the
   destination's `into` liner, the `issues` liner, or a fallback `olwb-errors`
@@ -38,6 +43,13 @@ All notable changes to olwb are documented here. Format loosely follows
   edits and selections made while it runs survive.
 - **Issue filing**: `/issues file` refuses a second invocation while an issues
   job is running, preventing duplicate GitHub issues.
+
+### Changed
+
+- **Bare input without a liner**: submitting text with no active liner now
+  turns it into a live `/open` query for Tab selection instead of creating a
+  `notes` liner and storing the text there. Slash commands and input within an
+  active liner keep their existing behavior.
 
 ### Docs
 

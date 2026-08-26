@@ -115,6 +115,22 @@ function M.has_label(list, name)
   return false
 end
 
+-- Liner labels must all match; free text searches identity and description.
+function M.liner_matches_query(liner, offered_key, query)
+  if not liner then return false end
+  query = query or {}
+  local meta = liner.metadata or {}
+  for _, label in ipairs(query.labels or {}) do
+    if not M.has_label(meta.labels, label) then return false end
+  end
+  local term = (query.term or ""):lower()
+  if term == "" then return true end
+  local haystack = table.concat({
+    offered_key or "", liner.id or "", meta.name or "", meta.description or "",
+  }, "\n"):lower()
+  return haystack:find(term, 1, true) ~= nil
+end
+
 -- Append if absent. Mutates and returns the list.
 function M.add_label(list, name)
   if not M.has_label(list, name) then

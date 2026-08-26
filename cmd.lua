@@ -31,26 +31,36 @@ M.subverbs = {
 
 M.dest_kinds = { "claude", "codex", "opencode" }
 
--- One row per command for the /? help menu: { usage, description }.
+-- One row per command for the /? help menu: { usage, description, alias? }.
 M.help_entries = {
-  { "/new [name]",            "create + activate a new liner" },
-  { "/open <name|id>",        "load + activate an existing liner" },
-  { "/close",                 "deactivate the liner (ends its session)" },
-  { "/save",                  "force a save (saves are automatic)" },
-  { "/liner name|desc|label|start|end",  "manage the active liner" },
-  { "/session name|label|start|end",     "manage the active session" },
-  { "/label <name>",          "toggle a label applied to new messages" },
-  { "/labels",                "list known labels with counts" },
-  { "/filter label: since: until: term:", "narrow the feed" },
+  { "/new [name]",            "create + activate a new liner", "n" },
+  { "/open <name|id|query>",  "search for or activate a liner", "o" },
+  { "/close",                 "deactivate the liner (ends its session)", "c" },
+  { "/save",                  "force a save (saves are automatic)", "v" },
+  { "/liner name|desc|label|start|end",  "manage the active liner", "r" },
+  { "/session name|label|start|end",     "manage the active session", "u" },
+  { "/label <name>",          "toggle a label applied to new messages", "l" },
+  { "/labels",                "list known labels with counts", "k" },
+  { "/filter label: since: until: term:", "narrow the feed", "f" },
   { "/filter clear",          "remove the active filter" },
-  { "/search <term>",         "substring search over the feed" },
-  { "/export [md|json] [path]", "write the feed to a file" },
-  { "/send <dest> [tui]",     "send selection (or scope) to a destination" },
-  { "/dest add|rm|into|kind|session", "manage send destinations" },
-  { "/issues draft|open|file|list|repo|model", "notes → agent-work GitHub issues" },
-  { "/list",                  "list liners with message counts" },
-  { "/set [option] [value]",  "view / change olwb options" },
-  { "/help",                  "this menu (also /?)" },
+  { "/search <term>",         "substring search over the feed", "q" },
+  { "/export [md|json] [path]", "write the feed to a file", "e" },
+  { "/send <dest> [tui]",     "send selection (or scope) to a destination", "s" },
+  { "/dest add|rm|into|kind|session", "manage send destinations", "d" },
+  { "/issues draft|open|file|list|repo|model", "notes → agent-work GitHub issues", "i" },
+  { "/list",                  "list liners with message counts", "a" },
+  { "/set [option] [value]",  "view / change olwb options", "t" },
+  { "/help",                  "this menu (also /?)", "h" },
+}
+
+-- Ordered rows make duplicate letters observable; a Lua map would silently
+-- discard the earlier owner before registration could reject the collision.
+M.aliases = {
+  { "n", "new" }, { "o", "open" }, { "c", "close" }, { "v", "save" },
+  { "r", "liner" }, { "u", "session" }, { "l", "label" }, { "k", "labels" },
+  { "f", "filter" }, { "q", "search" }, { "e", "export" }, { "s", "send" },
+  { "d", "dest" }, { "i", "issues" }, { "a", "list" }, { "t", "set" },
+  { "h", "help" },
 }
 
 -------------------------------------------------------------------------------
@@ -86,6 +96,23 @@ end
 -- Is this compose line a slash command?
 function M.is_command(line)
   return (line:gsub("^%s+", "")):sub(1, 1) == "/"
+end
+
+-- Split an /open search into label constraints and the remaining text.
+-- Repeated labels are intentionally preserved: the model ANDs all of them.
+function M.parse_open_query(input)
+  local query = { labels = {}, term = "" }
+  local terms = {}
+  for tok in (input or ""):gmatch("%S+") do
+    local label = tok:match("^label:(.+)$")
+    if label then
+      query.labels[#query.labels + 1] = label:gsub("^#", "")
+    else
+      terms[#terms + 1] = tok
+    end
+  end
+  query.term = table.concat(terms, " ")
+  return query
 end
 
 -------------------------------------------------------------------------------
@@ -124,8 +151,15 @@ function M.candidates(line, extra)
     pool = M.verbs
     kept = "/"
   else
-    local verb, sub = toks[1], toks[2]
-    if n == 2 then
+    local verb = (M.alias_targets and M.alias_targets[toks[1]]) or toks[1]
+    local sub = toks[2]
+    if verb == "open" and extra.open_query then
+      -- The supplied pool already reflects the whole query (including any
+      -- label: tokens), so selection replaces that query with one exact key.
+      pool = extra.liners
+      part = ""
+      kept = "/open "
+    elseif n == 2 then
       if M.subverbs[verb] then
         pool = M.subverbs[verb]
       elseif verb == "open" then
@@ -159,7 +193,7 @@ function M.candidates(line, extra)
       end
     end
     if not pool then return {}, "", "" end
-    kept = "/" .. table.concat(toks, " ", 1, n - 1) .. " "
+    kept = kept or ("/" .. table.concat(toks, " ", 1, n - 1) .. " ")
   end
   local out = {}
   for _, v in ipairs(pool) do
@@ -217,7 +251,10 @@ end
 
 H["open"] = function(ctx, args, rest)
   local key = ctx.model.trim(rest)
-  if key == "" then ctx.error("usage: /open <name|id>") return end
+  if key == "" then
+    ctx.error("usage: /open <name|id> (or type a query and press Tab)")
+    return
+  end
   local liner = ctx.open_liner(key)
   if liner then
     ctx.info("opened " .. (liner.metadata.name ~= "" and liner.metadata.name
@@ -579,6 +616,23 @@ H["help"] = function(ctx)
   ctx.open_help()
 end
 H["?"] = H["help"]
+
+-- Install aliases into a handler table, rejecting a missing target or any
+-- collision with a full command or an alias installed earlier in the list.
+function M.install_aliases(handlers, aliases)
+  for _, row in ipairs(aliases) do
+    local alias, target = row[1], row[2]
+    assert(handlers[target], "command alias /" .. alias
+      .. " targets missing /" .. tostring(target))
+    assert(not handlers[alias], "command alias collision: /" .. alias)
+    handlers[alias] = handlers[target]
+  end
+end
+
+M.install_aliases(H, M.aliases)
+
+M.alias_targets = {}
+for _, row in ipairs(M.aliases) do M.alias_targets[row[1]] = row[2] end
 
 M.handlers = H
 

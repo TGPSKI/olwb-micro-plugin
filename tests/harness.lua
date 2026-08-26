@@ -275,7 +275,11 @@ local okopen, erropen = xpcall(function() ENV.olwb_command(nil, {}) end, debug.t
 ok(okopen, "open UI via olwb_command runs without error")
 if not okopen then io.write("  open error: " .. tostring(erropen) .. "\n") end
 
--- Build a compose buffer/pane and route Enter through preInsertNewline.
+-- Create a liner, then route a capture through preInsertNewline. Bare input
+-- without a liner is tested separately below as the open-search path.
+local created = pcall(ENV.preInsertNewline,
+  new_mock_pane(new_mock_buffer("/new notes", "olwb://compose")))
+ok(created, "/new creates the harness liner")
 local compose = new_mock_buffer("first captured line", "olwb://compose")
 local cpane = new_mock_pane(compose)
 -- olwb.lua holds its own feed_pane ref from open_olwb; reuse the real callback.
@@ -307,6 +311,20 @@ local function submit_command(line)
   return pcall(ENV.preInsertNewline,
     new_mock_pane(new_mock_buffer(line, "olwb://compose")))
 end
+
+ok(submit_command("/close"), "/close prepares the no-liner dispatch case")
+local search_buf = new_mock_buffer("first captured", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(search_buf)),
+  "bare no-liner input runs")
+ok(search_buf:Line(0) == "/open first captured",
+  "bare no-liner input becomes a live /open search")
+
+local slash_buf = new_mock_buffer("/list", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(slash_buf)),
+  "slash input still dispatches without a liner")
+ok(slash_buf:Line(0) == "", "slash input is not converted to open search")
+
+ok(submit_command("/open notes"), "/open restores the active liner")
 
 local function last_executor_job()
   for i = #job_log, 1, -1 do

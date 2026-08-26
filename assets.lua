@@ -144,7 +144,7 @@ the input grows automatically when a long line wraps.
     /new [name]              /n    create + activate a new liner
     /open <name|id|query>    /o    search for or activate a liner
     /close                   /c    deactivate liner (ends its session)
-    /save                    /v    force a save (saves are automatic)
+    /save [name]             /v    save; name promotes an instant liner
 
     /liner start|end         /r    start / end the active liner
     /liner name <s> | desc <s>     set liner name / description
@@ -212,6 +212,8 @@ seeded to <datadir>/issues-prompt.md and yours to edit.
 ## Native commands
 
     > olwb                         open / focus the UI
+    > olwb -i                      enter a memory-only instant liner
+    > olwb resume                  resume the most recent durable liner
     > olwb <slash-verb> [args]     run any command above without the leading /
     > olwb migrate <dir>           import an Electron OLWB userData directory
     > olwb rescan                  rebuild the liner registry from disk
@@ -220,7 +222,8 @@ seeded to <datadir>/issues-prompt.md and yours to edit.
 ## Options (set from inside olwb with /set <name> <value>)
 
     olwb.datadir       storage dir (default $XDG_DATA_HOME/olwb)
-    olwb.autostart     open olwb on launch when no file is given (default off)
+    olwb.autostart     open on no-file launch (default off);
+                       OLWB_AUTOSTART=1 overrides for one launch, even with a file
     olwb.timefmt       strftime for timestamps (default %Y-%m-%d %H:%M:%S)
     olwb.composesize   minimum one-line height in rows (default 1; grows as
                        needed up to 8)
@@ -228,6 +231,20 @@ seeded to <datadir>/issues-prompt.md and yours to edit.
     olwb.termcmd       terminal command for /send <dest> tui (auto-detected;
                        stored in state.json, not micro settings)
     olwb.theme         apply the bundled olwb colorscheme (default off)
+
+## Entry points
+
+    Alt-o          lua:olwb.launch    open / focus without selecting a liner
+    Alt-Shift-o    lua:olwb.resume    activate the most recent durable liner
+    Alt-Shift-i    lua:olwb.instant   enter a memory-only instant liner
+    Alt-i          lua:olwb.key_inbox toggle the inbox
+
+Existing user bindings win. In instant mode, captures can be sent/exported;
+`/save <name>` promotes the liner; switching to another liner, `/close`, resume,
+or exit discards it.
+`OLWB_AUTOSTART=1 micro [file]` is per-invocation and is not persisted.
+`micro -olwb.autostart true` cannot work because micro parses flags before
+plugins register options.
 
 ## Storage
 

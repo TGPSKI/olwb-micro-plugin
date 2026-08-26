@@ -7,6 +7,15 @@ All notable changes to olwb are documented here. Format loosely follows
 
 ### Added
 
+- **Instant liners**: `> olwb -i` and `Alt-Shift-i` open a memory-only liner
+  whose captures can use selection, send, export, and issues workflows.
+  `/save <name>` promotes it; switching liners, closing, resuming, or exiting
+  discards it without changing durable active-liner state.
+- **Explicit entry modes**: bindable `launch`, `resume`, and `instant` Lua
+  functions default to `Alt-o`, `Alt-Shift-o`, and `Alt-Shift-i` without
+  overwriting existing user bindings.
+- **Per-invocation autostart**: a non-empty `OLWB_AUTOSTART` opens olwb for one
+  micro process, including file-backed launches, without persisting the option.
 - **Open-view queries**: `/open` candidates now accept repeated `label:`
   tokens (ANDed against liner labels) plus case-insensitive text matched
   against liner names, ids, and descriptions.

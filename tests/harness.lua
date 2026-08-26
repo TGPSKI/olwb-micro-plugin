@@ -26,11 +26,13 @@ os.execute("mkdir -p '" .. datadir .. "'")
 local function sh_quote(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 
 local mock = {}
+local mock_env = {}
 
 mock["os"] = {
   O_CREATE = 1, O_EXCL = 2, O_WRONLY = 4,
   Getenv = function(k)
     if k == "XDG_DATA_HOME" then return datadir end
+    if mock_env[k] ~= nil then return mock_env[k] end
     return os.getenv(k) or ""
   end,
   MkdirAll = function(path, _) os.execute("mkdir -p " .. sh_quote(path)); return nil end,
@@ -113,12 +115,16 @@ mock["micro"] = {
 }
 
 local opts = {}
+local bind_log = {}
 mock["micro/config"] = {
   RegisterCommonOption = function(pl, name, def) opts[pl .. "." .. name] = def end,
   GetGlobalOption = function(name) return opts[name] end,
   SetGlobalOption = function() return nil end,
   MakeCommand = function() end,
-  TryBindKey = function() return true, nil end,
+  TryBindKey = function(key, action, overwrite)
+    bind_log[#bind_log + 1] = { key, action, overwrite }
+    return true, nil
+  end,
   AddRuntimeFileFromMemory = function() end,
   SetStatusInfoFn = function() end,
   NoComplete = nil,
@@ -157,14 +163,21 @@ local function new_mock_buffer(text, path)
   return b
 end
 
+local split_count = 0
 local function new_mock_pane(buf)
   local p
   p = {
     Buf = buf,
     Cursor = { GotoLoc = function() end, ResetSelection = function() end },
     OpenBuffer = function(self, b) self.Buf = b end,
-    HSplitBuf = function(self, b) return new_mock_pane(b) end,
-    VSplitBuf = function(self, b) return new_mock_pane(b) end,
+    HSplitBuf = function(self, b)
+      split_count = split_count + 1
+      return new_mock_pane(b)
+    end,
+    VSplitBuf = function(self, b)
+      split_count = split_count + 1
+      return new_mock_pane(b)
+    end,
     ResizePane = function() end,
     GetView = function() return { X = 0, Y = 0, Width = 80, Height = 22 } end,
     Relocate = function() end,
@@ -269,11 +282,71 @@ if not okinit then io.write("  init error: " .. tostring(errinit) .. "\n") end
 local function exists(p) local f = io.open(p, "r"); if f then f:close(); return true end return false end
 ok(exists(datadir .. "/olwb/liners"), "datadir/liners created by setup()")
 
--- Open the UI via the public entry point (>olwb with no args). open_olwb is a
--- file-local reached through this closure, exactly as micro invokes it.
-local okopen, erropen = xpcall(function() ENV.olwb_command(nil, {}) end, debug.traceback)
-ok(okopen, "open UI via olwb_command runs without error")
+local binds = {}
+for _, row in ipairs(bind_log) do binds[row[1]] = row end
+ok(binds["Alt-o"] and binds["Alt-o"][2] == "lua:olwb.launch"
+  and binds["Alt-o"][3] == false, "Alt-o binds launch without overwrite")
+ok(binds["Alt-O"] and binds["Alt-O"][2] == "lua:olwb.resume"
+  and binds["Alt-O"][3] == false, "Alt-Shift-o binds resume without overwrite")
+ok(binds["Alt-I"] and binds["Alt-I"][2] == "lua:olwb.instant"
+  and binds["Alt-I"][3] == false, "Alt-Shift-i binds instant without overwrite")
+ok(binds["Alt-i"] and binds["Alt-i"][2] == "lua:olwb.key_inbox",
+  "Alt-i remains the inbox binding")
+
+-- Cold launch and repeated entry use the named public functions without
+-- creating duplicate pane stacks.
+local okopen, erropen = xpcall(function() ENV.launch(nil) end, debug.traceback)
+ok(okopen, "cold lua:olwb.launch runs without error")
 if not okopen then io.write("  open error: " .. tostring(erropen) .. "\n") end
+local launched_splits = split_count
+ok(pcall(ENV.launch, nil), "launch runs when the UI is already open")
+ok(split_count == launched_splits, "repeated launch creates no duplicate panes")
+ok(pcall(ENV.resume, nil), "resume without history falls back to launch")
+ok(ENV.statusinfo() == "no liner", "resume fallback leaves no active liner")
+
+-- Native instant entry captures in memory and /close discards without a file.
+ok(pcall(ENV.olwb_command, nil, { "-i" }), ">olwb -i enters instant mode")
+local instant_buf = new_mock_buffer("discard this", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(instant_buf)),
+  "instant capture runs")
+ok(#ENV.olwb_store.list_liner_ids() == 0,
+  "instant capture creates no liner file")
+ok(pcall(ENV.preInsertNewline,
+  new_mock_pane(new_mock_buffer("/close", "olwb://compose"))),
+  "instant /close runs")
+ok(#ENV.olwb_store.list_liner_ids() == 0,
+  "discarded instant liner leaves no liner file")
+
+-- Promotion gives the same in-memory liner a durable name and file.
+ok(pcall(ENV.instant, nil), "lua:olwb.instant enters instant mode")
+ok(pcall(ENV.instant, nil), "instant entry is idempotent while active")
+local promote_buf = new_mock_buffer("keep this", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(promote_buf)),
+  "promoted instant capture runs")
+ok(pcall(ENV.preInsertNewline,
+  new_mock_pane(new_mock_buffer("/save quick", "olwb://compose"))),
+  "instant /save <name> promotes")
+local promoted_blob = ""
+local promoted_pipe = io.popen("cat " .. datadir .. "/olwb/liners/*.json 2>/dev/null")
+if promoted_pipe then promoted_blob = promoted_pipe:read("*a"); promoted_pipe:close() end
+ok(promoted_blob:find("keep this", 1, true)
+  and promoted_blob:find('"name":"quick"', 1, true),
+  "promotion persists the instant content and name")
+ok(pcall(ENV.preInsertNewline,
+  new_mock_pane(new_mock_buffer("/close", "olwb://compose"))),
+  "promoted liner closes through the durable path")
+ok(pcall(ENV.instant, nil), "instant entry before direct resume runs")
+local resume_discard_buf = new_mock_buffer("resume discards this", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(resume_discard_buf)),
+  "capture before direct resume runs")
+ok(pcall(ENV.resume, nil), "resume discards instant and activates durable history")
+local resume_pipe = io.popen("cat " .. datadir .. "/olwb/liners/*.json 2>/dev/null")
+local resume_blob = resume_pipe and resume_pipe:read("*a") or ""
+if resume_pipe then resume_pipe:close() end
+ok(not resume_blob:find("resume discards this", 1, true),
+  "resume does not persist the discarded instant liner")
+ok(ENV.statusinfo():find("quick", 1, true) ~= nil,
+  "resume activates durable history after instant discard")
 
 -- Create a liner, then route a capture through preInsertNewline. Bare input
 -- without a liner is tested separately below as the open-search path.
@@ -344,6 +417,37 @@ local function fixture(name)
   local s = f:read("*a"); f:close(); return s
 end
 
+-- A benefit snapshots instant content before /close discards its liner.
+local durable_before_instant = #ENV.olwb_store.list_liner_ids()
+local durable_state = ENV.olwb_json.decode(
+  ENV.olwb_store.read_file(ENV.olwb_store.state_path()))
+ok(pcall(ENV.instant, nil), "instant entry before benefit send runs")
+local benefit_buf = new_mock_buffer("temporary benefit", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(benefit_buf)),
+  "instant benefit capture runs")
+local state_during_instant = ENV.olwb_json.decode(
+  ENV.olwb_store.read_file(ENV.olwb_store.state_path()))
+ok(state_during_instant.activeLinerId == durable_state.activeLinerId
+  and state_during_instant.activeSessionId == durable_state.activeSessionId,
+  "instant capture leaves durable active ids unchanged")
+ok(submit_command("/send file"), "instant content starts a destination send")
+local instant_job = last_executor_job()
+ok(instant_job and instant_job.payload
+  and instant_job.payload:find("temporary benefit", 1, true),
+  "instant destination payload contains the captured line")
+ok(submit_command("/close"), "instant liner can close while send runs")
+ok(#ENV.olwb_store.list_liner_ids() == durable_before_instant,
+  "instant send and discard add no liner file")
+local after_discard_pipe = io.popen("cat " .. datadir .. "/olwb/liners/*.json 2>/dev/null")
+local after_discard_blob = after_discard_pipe and after_discard_pipe:read("*a") or ""
+if after_discard_pipe then after_discard_pipe:close() end
+ok(not after_discard_blob:find("temporary benefit", 1, true),
+  "discarded instant content is absent from durable liners")
+finish_job(instant_job, "", "")
+ok(pcall(ENV.resume, nil), "resume returns to a durable liner after discard")
+ok(ENV.statusinfo():find("notes", 1, true) ~= nil,
+  "resume activates the most recently updated durable liner")
+
 -- A successful adapted send seeds a resumable destination session.
 ok(submit_command("/send claude"), "first adapted send starts")
 local seed_job = last_executor_job()
@@ -413,6 +517,15 @@ ok(ENV.olwb_store.save_state(stale_state), "local session deletion saves")
 disk = ENV.olwb_json.decode(ENV.olwb_store.read_file(ENV.olwb_store.state_path()))
 ok(disk.dest_sessions.local_a == nil and disk.dest_sessions.remote_b == "b"
   and disk.dest_sessions.remote_d == "d", "session deletion preserves remote keys")
+
+local before_exit_count = #ENV.olwb_store.list_liner_ids()
+ok(pcall(ENV.instant, nil), "instant entry before deinit runs")
+local exit_buf = new_mock_buffer("discard on exit", "olwb://compose")
+ok(pcall(ENV.preInsertNewline, new_mock_pane(exit_buf)),
+  "instant capture before deinit runs")
+ok(pcall(ENV.deinit), "deinit discards instant state")
+ok(#ENV.olwb_store.list_liner_ids() == before_exit_count,
+  "editor exit creates no instant liner file")
 
 io.write(string.format("\nharness: %d passed, %d failed\n", passed, failed))
 io.write("datadir: " .. datadir .. "/olwb\n")

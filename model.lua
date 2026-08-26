@@ -103,6 +103,13 @@ function M.is_blank(s)
   return M.trim(s or "") == ""
 end
 
+-- An environment request is per-invocation and explicit; the persisted option
+-- keeps its guarded no-file launch behavior through the emptyish input.
+function M.should_autostart(configured, env_value, emptyish)
+  return (env_value ~= nil and env_value ~= "")
+    or (configured == true and emptyish == true)
+end
+
 -------------------------------------------------------------------------------
 -- Labels
 -------------------------------------------------------------------------------
